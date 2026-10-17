@@ -162,22 +162,27 @@ class TestInstallations:
             ],
         )
         github.on(
-            "GET",
-            "/user/installations/42/repositories",
-            {"total_count": 1, "repositories": [{"full_name": "globex/parse-locale"}]},
+            "POST",
+            "/app/installations/42/access_tokens",
+            {"token": "ghs_42", "expires_at": IN_AN_HOUR},
+            status=201,
+        )
+        github.on(
+            "POST",
+            "/app/installations/43/access_tokens",
+            {"token": "ghs_43", "expires_at": IN_AN_HOUR},
+            status=201,
         )
         github.on(
             "GET",
-            "/user/installations/43/repositories",
-            {"total_count": 1, "repositories": [{"full_name": "acme/widgets"}]},
+            "/installation/repositories",
+            {"total_count": 1, "repositories": [{"full_name": "globex/parse-locale"}]},
         )
 
-        found = app.list_installations()
+        app.list_installations()
 
-        assert [(i.id, i.login, i.repositories) for i in found] == [
-            (42, "globex", ("globex/parse-locale",)),
-            (43, "acme", ("acme/widgets",)),
-        ]
+        used = github.last("GET", "/installation/repositories").headers["Authorization"]
+        assert used == "token ghs_43", used
 
 
 class TestReadPath:

@@ -125,14 +125,21 @@ class GitHubApp:
         )
 
     def _installation_repositories(self, installation: int) -> list[str]:
-        """Every repository an installation covers, across its pages."""
+        """Every repository an installation covers, across its pages.
+
+        `/installation/repositories` needs an installation token: the App JWT gets a 401
+        here, which is what made the sweeper's reconcile fail against the live App.
+        """
+        token = self._call(
+            "POST", f"/app/installations/{installation}/access_tokens", auth=self._as_app()
+        )
         names: list[str] = []
         page = 1
         while page <= MAX_REPOSITORY_PAGES:
             listing = self._call(
                 "GET",
-                f"/user/installations/{installation}/repositories",
-                auth=self._as_app(),
+                "/installation/repositories",
+                auth=f"token {token['token']}",
                 params={"per_page": "100", "page": str(page)},
             )
             batch = (listing or {}).get("repositories") or []
