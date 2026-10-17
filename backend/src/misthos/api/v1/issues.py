@@ -8,13 +8,14 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from misthos.api.guards import idempotent, limit_actions, limit_publish
+from misthos.api.public import public
 from misthos.api.session import (
     SIGNED_IN,
     require_github,
-    require_owner_or_simulation,
+    require_owner,
     require_role,
 )
-from misthos.api.v1.auth import callback_url, oauth_configured
+from misthos.api.v1.auth import callback_url, circle_sign_in_configured, oauth_configured
 from misthos.config import settings
 from misthos.domain.compliance import ComplianceRefusal
 from misthos.domain.escrow import approve_call, commit_call, issue_key
@@ -32,14 +33,12 @@ from misthos.schemas import (
     CriteriaRequest,
     Decision,
     DeclineRequest,
-    DemoPullRequestOut,
     DisputeRequest,
     EscrowReadback,
     FundRequest,
     HealthOut,
     IssueOut,
     IssueSummaryOut,
-    LoopOut,
     MetricsOut,
     PriceRequest,
     Publisher,
@@ -61,7 +60,6 @@ from misthos.store import (
     DeclineRefused,
     DisputeRefused,
     IssueRecord,
-    NotSimulated,
     NotTheSubmission,
     UnreadableIssue,
     UntestableCriteria,
@@ -102,14 +100,6 @@ IDEMPOTENCY_KEY = Header(
 )
 
 
-_STEPPER = "the demo stepper is the simulation's; use the explicit actions"
-
-
-def _demo_only(what: str = _STEPPER) -> None:
-    if not settings.simulated:
-        raise HTTPException(status_code=403, detail=what)
-
-
 def _who(account: Account | None, fallback: str) -> str:
     return (account.github_login or account.address) if account else fallback
 
@@ -119,7 +109,15 @@ def _refused(exc: Exception) -> HTTPException:
     return HTTPException(status_code=403, detail=str(exc))
 
 
-@router.get("/health", response_model=HealthOut)
+@router.get(
+    "/health",
+    response_model=HealthOut,
+    openapi_extra=public(
+        "Core",
+        "Health",
+        "Network, contract addresses and the money mode this deployment is running.",
+    ),
+)
 async def health() -> HealthOut:
     return HealthOut(
         status="ok",
@@ -129,15 +127,22 @@ async def health() -> HealthOut:
         network_label=settings.network.label,
         money=settings.network.money,
         money_note=settings.network.description,
-        seeded_issues=await run_in_threadpool(store.count_issues),
-        simulated=settings.simulated,
         # The web app offers "Link with GitHub" only where it can work (#118).
         github_oauth=oauth_configured(),
         github_oauth_callback_url=callback_url(),
+        circle_sign_in=circle_sign_in_configured(),
     )
 
 
-@router.get("/issues", response_model=list[IssueSummaryOut])
+@router.get(
+    "/issues",
+    response_model=list[IssueSummaryOut],
+    openapi_extra=public(
+        "Marketplace",
+        "List issues",
+        "Every published issue with its price, state and acceptance criteria.",
+    ),
+)
 async def list_issues(
     state: str | None = Query(default=None, description="Filter by lifecycle state"),
     publisher_id: str | None = None,
@@ -158,20 +163,36 @@ async def list_issues(
     return await run_in_threadpool(store.summaries, records)
 
 
-@router.get("/issues/{issue_id}", response_model=IssueOut)
+@router.get(
+    "/issues/{issue_id}",
+    response_model=IssueOut,
+    openapi_extra=public(
+        "Marketplace",
+        "Issue detail",
+        "One issue, its escrow commitment, publisher and current lifecycle state.",
+    ),
+)
 async def get_issue(issue_id: str) -> IssueOut:
     rec = await _require(issue_id)
     return await run_in_threadpool(store.to_out, rec)
 
 
-@router.get("/issues/{issue_id}/timeline", response_model=list[TimelineEntry])
+@router.get(
+    "/issues/{issue_id}/timeline",
+    response_model=list[TimelineEntry],
+    openapi_extra=public(
+        "Marketplace",
+        "Issue timeline",
+        "The public audit trail: pricing, funding, claims, reviews and settlement.",
+    ),
+)
 async def get_timeline(issue_id: str) -> list[TimelineEntry]:
     return store.timeline(await _require(issue_id))
 
 
 def _escrow_source() -> tuple[ChainGateway, str]:
-    """The escrow the store settles through: the simulated books, or the contract."""
-    return store.chain, "simulation" if settings.simulated else "chain"
+    """The escrow the store settles through."""
+    return store.chain, "chain"
 
 
 @router.get("/issues/{issue_id}/commitment", response_model=CommitmentPlan)
@@ -196,7 +217,7 @@ async def commitment_plan(
     chain, and it never matches again (#126).
     """
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "fund this issue")
+    require_owner(account, rec.publisher_id, "fund this issue")
     terms = rec.funding
     if rec.price is None or terms is None:
         raise HTTPException(
@@ -227,7 +248,15 @@ async def commitment_plan(
     )
 
 
-@router.get("/issues/{issue_id}/escrow", response_model=EscrowReadback)
+@router.get(
+    "/issues/{issue_id}/escrow",
+    response_model=EscrowReadback,
+    openapi_extra=public(
+        "Trust",
+        "Escrow readback",
+        "The commitment as MisthosEscrow on Arc holds it, read from the chain.",
+    ),
+)
 async def get_escrow(issue_id: str) -> EscrowReadback:
     """Read the commitment back from the escrow, so nobody has to take our word."""
     await _require(issue_id)
@@ -268,7 +297,7 @@ async def _act(
         NotTheSubmission,
     ) as exc:
         raise _conflict(exc) from exc
-    except (ComplianceRefusal, PolicyRefusal, NotSimulated) as exc:
+    except (ComplianceRefusal, PolicyRefusal) as exc:
         raise _refused(exc) from exc
     except PriceRefused as exc:
         # The request named a price; it is the value in it that cannot be used, which is
@@ -301,39 +330,6 @@ async def _act(
 
 
 @router.post(
-    "/issues/{issue_id}/advance",
-    response_model=IssueOut,
-    dependencies=[limit_actions],
-    responses={409: {"description": "Illegal step, busy issue or refused by the escrow"}},
-)
-async def advance(
-    issue_id: str, request: Request, idempotency_key: str | None = IDEMPOTENCY_KEY
-) -> Any:
-    """Move the issue one step along the demo path. The simulation's only: it
-    fabricates the pull request, so a deployment uses the explicit actions."""
-    _demo_only()
-    await _require(issue_id)
-    return await idempotent(request, idempotency_key, lambda: _act(store.advance, issue_id))
-
-
-@router.post(
-    "/issues/{issue_id}/complete",
-    response_model=IssueOut,
-    dependencies=[limit_actions],
-    responses={409: {"description": "Illegal step, busy issue or refused by the escrow"}},
-)
-async def complete(
-    issue_id: str, request: Request, idempotency_key: str | None = IDEMPOTENCY_KEY
-) -> Any:
-    """Run the rest of the happy path: verdict, merge, release. The simulation's only."""
-    _demo_only()
-    await _require(issue_id)
-    return await idempotent(
-        request, idempotency_key, lambda: _act(store.approve_and_accept, issue_id)
-    )
-
-
-@router.post(
     "/issues/{issue_id}/decline",
     response_model=IssueOut,
     dependencies=[limit_actions],
@@ -350,7 +346,7 @@ async def decline(
     the work goes back for rework, and after that the merge or the grace period
     settles it."""
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "decline this work")
+    require_owner(account, rec.publisher_id, "decline this work")
     return await idempotent(
         request, idempotency_key, lambda: _act(store.decline, issue_id, payload.reason)
     )
@@ -380,14 +376,12 @@ async def approve_release(
     The approver is whoever is signed in, by the GitHub login linked to their account,
     and the organisation must have named that login. A name in the request would let
     anyone who knew an approver's name release the money, so it counts only in the
-    simulation, for a visitor who is not signed in, as the claim's does.
+    the signed-in account, which must carry a linked GitHub login.
     """
     await _require(issue_id)
     if account is not None:
         require_github(account, "approve a release")
         approver = account.github_login
-    elif settings.simulated and payload is not None and payload.approver:
-        approver = payload.approver
     else:
         raise HTTPException(status_code=401, detail="sign in as a named approver to approve")
     return await idempotent(
@@ -409,7 +403,7 @@ async def approve_criteria(
     """The publisher edits the drafted acceptance criteria and approves them. No
     issue is funded without approved criteria (#21)."""
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "approve these criteria")
+    require_owner(account, rec.publisher_id, "approve these criteria")
     if account is not None:
         require_github(account, "approve criteria")
     by = _who(account, "the publisher")
@@ -435,7 +429,7 @@ async def fund(
     way to change the number at the moment money moves is a second thing to audit (#142).
     """
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "fund this issue")
+    require_owner(account, rec.publisher_id, "fund this issue")
     if account is not None:
         require_github(account, "fund an issue")
     by = _who(account, "the publisher")
@@ -471,7 +465,7 @@ async def set_price(
     nobody claimed on the publisher's behalf (#142).
     """
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "re-price this issue")
+    require_owner(account, rec.publisher_id, "re-price this issue")
     if account is not None:
         require_github(account, "re-price an issue")
     by = _who(account, "the publisher")
@@ -509,8 +503,6 @@ async def claim(
         require_role(account, "contributor", "claim an issue")
         require_github(account, "claim an issue")
         contributor_id = account.party_id
-    elif settings.simulated and payload is not None and payload.contributor_id:
-        contributor_id = payload.contributor_id
     else:
         raise HTTPException(status_code=401, detail="sign in as a contributor to claim")
     if await run_in_threadpool(store.get_contributor, contributor_id) is None:
@@ -531,7 +523,7 @@ async def submit(
     """The claimant submits their pull request for review. GitHub says who opened it,
     and only the claimant's own pull request counts."""
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.contributor_id or "", "submit for this claim")
+    require_owner(account, rec.contributor_id or "", "submit for this claim")
     if account is not None:
         require_github(account, "submit work")
     try:
@@ -554,7 +546,7 @@ async def review(issue_id: str, account: Account | None = SIGNED_IN) -> IssueOut
     rec = await _require(issue_id)
     if account is not None and account.party_id not in {rec.publisher_id, rec.contributor_id}:
         raise HTTPException(status_code=403, detail="only the publisher or the claimant can ask")
-    if account is None and not settings.simulated:
+    if account is None:
         raise HTTPException(status_code=401, detail="sign in to ask for a review")
     try:
         reviewed = await run_in_threadpool(store.review, issue_id)
@@ -565,15 +557,6 @@ async def review(issue_id: str, account: Account | None = SIGNED_IN) -> IssueOut
     if reviewed is None:
         raise HTTPException(status_code=409, detail=f"{issue_id} has no commit awaiting a verdict")
     return await run_in_threadpool(store.to_out, reviewed)
-
-
-@router.get("/loop", response_model=LoopOut)
-async def loop(
-    repo: str | None = Query(default=None, description="owner/name; every repository if empty"),
-) -> LoopOut:
-    """The loop in public: issues funded, settled and paid, for one repository or all.
-    Built for a repository's watchers to see, so it carries no wallet or transfer."""
-    return await run_in_threadpool(store.loop, repo)
 
 
 @router.post(
@@ -592,7 +575,7 @@ async def dispute(
     """The contributor challenges a rework or reject verdict: the same commit is
     reviewed again against the published criteria, and the outcome is recorded."""
     rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.contributor_id or "", "dispute this verdict")
+    require_owner(account, rec.contributor_id or "", "dispute this verdict")
     return await idempotent(
         request, idempotency_key, lambda: _act(store.dispute, issue_id, payload.reason)
     )
@@ -631,7 +614,7 @@ async def publish(
         require_github(account, "publish an issue")
         # A signed-in publisher publishes as itself, whatever the form says.
         payload = payload.model_copy(update={"publisher_id": account.party_id})
-    elif not settings.simulated:
+    else:
         raise HTTPException(status_code=401, detail="sign in to publish an issue")
     if await run_in_threadpool(store.get_publisher, payload.publisher_id) is None:
         raise HTTPException(status_code=400, detail=f"unknown publisher {payload.publisher_id}")
@@ -660,13 +643,21 @@ async def publish(
     return await idempotent(request, idempotency_key, run, status_code=201)
 
 
-@router.get("/publishers", response_model=list[PublisherListing])
+@router.get(
+    "/publishers",
+    response_model=list[PublisherListing],
+    openapi_extra=public(
+        "Marketplace",
+        "Publisher directory",
+        "Every publisher and its wallet; its budget and policy only to itself.",
+    ),
+)
 async def list_publishers(account: Account | None = SIGNED_IN) -> list[PublisherListing]:
-    """Every publisher. Outside the simulation a publisher's budget and spending
-    policy are served only to that publisher, signed in."""
+    """Every publisher. A publisher's budget and spending policy are served only to
+    that publisher, signed in."""
     rows = await run_in_threadpool(store.list_publishers)
     mine = account.party_id if account is not None else None
-    return [_listing(p, own=settings.simulated or p.id == mine) for p in rows]
+    return [_listing(p, own=p.id == mine) for p in rows]
 
 
 def _listing(publisher: Publisher, *, own: bool) -> PublisherListing:
@@ -676,91 +667,32 @@ def _listing(publisher: Publisher, *, own: bool) -> PublisherListing:
         id=publisher.id,
         name=publisher.name,
         kind=publisher.kind,
-        tier=publisher.tier,
         wallet=publisher.wallet,
     )
 
 
-@router.get("/metrics", response_model=MetricsOut)
+@router.get(
+    "/metrics",
+    response_model=MetricsOut,
+    openapi_extra=public(
+        "Analytics",
+        "Marketplace metrics",
+        "Settlement volume, take rate, time to merge and live issue counts.",
+    ),
+)
 async def metrics() -> MetricsOut:
     return await run_in_threadpool(store.metrics)
 
 
-@router.get("/decisions", response_model=list[Decision])
+@router.get(
+    "/decisions",
+    response_model=list[Decision],
+    openapi_extra=public(
+        "Trust",
+        "Decision log",
+        "The newest decisions, up to 500: who decided what, by which rule.",
+    ),
+)
 async def decisions(limit: int = Query(default=50, le=500)) -> list[Decision]:
     """The append-only decision log across every issue, newest first."""
     return await run_in_threadpool(store.list_decisions, limit)
-
-
-@router.post(
-    "/demo/issues/{issue_id}/pull-request",
-    response_model=DemoPullRequestOut,
-    dependencies=[limit_actions],
-    responses={
-        403: {"description": "Outside the simulation, or not the claimant"},
-        409: {"description": "Nothing claimed and waiting for a pull request"},
-    },
-)
-async def demo_pull_request(
-    issue_id: str, account: Account | None = SIGNED_IN
-) -> DemoPullRequestOut:
-    """Open the claimant's pull request on the simulated GitHub, so the browser can
-    submit it. The simulation's only; submitting stays the claimant's own action."""
-    _demo_only("pull requests are opened on GitHub outside the simulation")
-    rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.contributor_id or "", "open a pull request here")
-    try:
-        pr = await run_in_threadpool(store.demo_pull_request, issue_id)
-    except NotSimulated as exc:
-        raise _refused(exc) from exc
-    except (IllegalTransition, StaleIssue, Busy) as exc:
-        raise _conflict(exc) from exc
-    return DemoPullRequestOut(pr_number=pr.number, author=pr.author, head_sha=pr.head_sha)
-
-
-@router.post(
-    "/demo/issues/{issue_id}/merge",
-    response_model=IssueOut,
-    dependencies=[limit_actions],
-    responses={
-        403: {"description": "Outside the simulation, or not the publisher"},
-        409: {"description": "No pull request to merge, or nothing to release"},
-    },
-)
-async def demo_merge(
-    issue_id: str,
-    request: Request,
-    idempotency_key: str | None = IDEMPOTENCY_KEY,
-    account: Account | None = SIGNED_IN,
-) -> Any:
-    """Merge the submitted pull request on the simulated GitHub, as the publisher
-    would on the real one; it is handled exactly as that merge's webhook. The
-    simulation's only."""
-    _demo_only("merge the pull request on GitHub outside the simulation")
-    rec = await _require(issue_id)
-    require_owner_or_simulation(account, rec.publisher_id, "merge this pull request")
-    return await idempotent(request, idempotency_key, lambda: _act(store.demo_merge, issue_id))
-
-
-@router.post(
-    "/demo/reset",
-    responses={
-        403: {
-            "description": "Outside the simulation, or a database is configured and its "
-            "operator has not allowed reset"
-        }
-    },
-)
-async def reset() -> dict[str, int]:
-    """Put the simulation back to its seed. With a database configured this deletes
-    every row in it, so it is refused there unless MISTHOS_ALLOW_DEMO_RESET is set."""
-    if not settings.simulated:
-        raise HTTPException(status_code=403, detail="reset is only available in simulation")
-    if settings.database_url and not settings.allow_demo_reset:
-        raise HTTPException(
-            status_code=403,
-            detail="reset would delete every row of the configured database; set "
-            "MISTHOS_ALLOW_DEMO_RESET=true only if that database is a throwaway demo",
-        )
-    await run_in_threadpool(store.reset)
-    return {"issues": await run_in_threadpool(store.count_issues)}

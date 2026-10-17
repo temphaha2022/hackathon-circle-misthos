@@ -12,16 +12,14 @@ from __future__ import annotations
 from misthos.repositories.base import (
     AccountConflict,
     AppendOnlyViolation,
-    PaymentAlreadyUsed,
     Repository,
-    Seed,
     StaleIssue,
 )
 from misthos.repositories.memory import MemoryRepository
 
 
 def build_repository(database_url: str) -> Repository:
-    """Memory when no database is configured, so the demo still needs nothing."""
+    """Memory when no database is configured, for a single local process."""
     if not database_url:
         return MemoryRepository()
     # Imported here so the zero-config path never loads a database driver.
@@ -34,9 +32,7 @@ __all__ = [
     "AccountConflict",
     "AppendOnlyViolation",
     "MemoryRepository",
-    "PaymentAlreadyUsed",
     "Repository",
-    "Seed",
     "StaleIssue",
     "build_repository",
 ]

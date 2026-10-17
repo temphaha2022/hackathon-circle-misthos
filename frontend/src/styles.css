@@ -184,6 +184,13 @@ code {
   transform: translateY(-1px);
 }
 
+/* While the sign-in gate is unfinished the way in opens it, so it is a button (#181). */
+button.nav-cta {
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+}
+
 .nav-cta svg,
 .footer-link svg {
   width: 13px;
@@ -936,20 +943,6 @@ a.chip:hover {
   line-height: 1.6;
 }
 
-/* ----------------------------------------------------------------- plans */
-
-/* Sentences, not hashes: wrap between words. */
-.kv.prose dd {
-  word-break: normal;
-}
-
-.plan-from,
-.plan-per {
-  font-family: var(--sans);
-  font-size: 13px;
-  letter-spacing: 0;
-}
-
 /* ----------------------------------------------------------- comparables */
 
 .comparables {
@@ -1076,14 +1069,7 @@ input[type='checkbox'] {
   align-self: flex-end;
 }
 
-.demo-shortcuts {
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px dashed var(--line-strong);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+
 
 /* Keyboard focus is always visible, in the ink colour. */
 a:focus-visible,

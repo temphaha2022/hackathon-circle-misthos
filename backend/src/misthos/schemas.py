@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field, model_validator
 from misthos.domain.money import Usdc
 from misthos.domain.repo import parse_repo_link
 
-Tier = Literal["open", "team", "enterprise"]
 Actor = Literal["agent", "publisher", "contributor", "system"]
 
 
@@ -43,14 +42,12 @@ class WalletSessionOut(BaseModel):
     encryption_key: str
     challenge_id: str | None = Field(description="None when the wallet already exists")
     wallet: Wallet | None
-    simulated: bool
 
 
 class Publisher(BaseModel):
     id: str
     name: str
     kind: Literal["company", "maintainer"]
-    tier: Tier
     wallet: Wallet
     budget_remaining_usdc: str
     # The organisation's own spending policy (domain/policy.py).
@@ -63,13 +60,12 @@ class Publisher(BaseModel):
 
 class PublisherListing(BaseModel):
     """A publisher as anyone may see it. Its budget and spending policy are
-    commercially sensitive, so outside the simulation they are filled in only for
+    commercially sensitive, so they are filled in only for
     the signed-in publisher itself ([PRIVACY.md](../../docs/PRIVACY.md))."""
 
     id: str
     name: str
     kind: Literal["company", "maintainer"]
-    tier: Tier
     wallet: Wallet
     budget_remaining_usdc: str | None = None
     approval_threshold_usdc: str | None = None
@@ -168,8 +164,8 @@ class EscrowCommitment(BaseModel):
     deadline: datetime
     fee_bps: int = 0
     """The platform's take rate for this issue, in basis points, fixed when the money
-    was committed. The escrow enforces this rate, not the publisher's tier at the
-    moment of release, so a plan that lapses mid-flight cannot move it."""
+    was committed. The escrow enforces this rate, so nothing after the commitment
+    can move it."""
     released: bool = False
     refunded: bool = False
 
@@ -203,9 +199,7 @@ class EscrowReadback(BaseModel):
     issue_key: str = Field(description="bytes32 the contract stores the issue under")
     contract: str
     chain_id: int
-    source: Literal["chain", "simulation"] = Field(
-        description="chain: read from MisthosEscrow; simulation: the simulated escrow's books"
-    )
+    source: Literal["chain"] = Field(description="read from MisthosEscrow")
     status: Literal["none", "held", "released", "refunded"]
     publisher: str | None
     amount: dict[str, str | int]
@@ -432,17 +426,80 @@ class SessionOut(BaseModel):
 
 
 class MeOut(BaseModel):
+    """Who is signed in, and how far through the sign-in gate they are (#181).
+
+    The gate's three steps read off this: signed in at all, a GitHub login (linked on
+    the account, or held while there is none), and an account, which is the side.
+    """
+
     address: str
     account: Account | None
+    pending_github_login: str | None = Field(
+        default=None,
+        description=(
+            "A GitHub login linked before the side was chosen. The account adopts it when "
+            "it is created, and from then on it is the account's github_login and this is "
+            "null."
+        ),
+    )
 
 
 class RoleRequest(BaseModel):
     role: Role
     name: str = Field(min_length=1, max_length=200)
-    """The organisation's name for a publisher; a working handle for a contributor
-    until their GitHub account is linked."""
+    """The organisation's name for a publisher. A contributor's handle is their GitHub
+    login once one is linked, which the sign-in gate does before this step."""
     budget_usdc: str = "5000"
     """A publisher's declared budget, which caps every price it is offered."""
+
+
+class CircleSignIn(BaseModel):
+    """Which Circle sign-in this browser is continuing (#181).
+
+    The id is the browser's own, random, and names the Circle user behind its wallet. It
+    is not a credential: Circle signs nothing for it without the PIN its owner set in
+    Circle's own frame.
+    """
+
+    sign_in_id: str = Field(pattern=r"^[A-Za-z0-9_-]{16,64}$")
+
+
+class CircleSignRequest(CircleSignIn):
+    message: str = Field(max_length=4000)
+    """The sign-in message `POST /auth/nonce` described, naming this wallet's address."""
+
+
+class CircleSignInSession(BaseModel):
+    """What Circle's frame needs to continue a sign-in with a Circle wallet."""
+
+    app_id: str
+    user_token: str
+    encryption_key: str
+    challenge_id: str | None
+    """Set when the wallet does not exist yet: the PIN and wallet challenge to run."""
+    address: str | None
+    """The wallet's address, once it exists. This is the address the sign-in message
+    names and the address `POST /auth/verify` recovers."""
+
+
+class CircleSignInWallet(BaseModel):
+    """A Circle sign-in wallet as it stands: its address once Circle has created it."""
+
+    address: str | None
+
+
+class CircleSignature(BaseModel):
+    """The answer to signing a sign-in message with a Circle wallet.
+
+    Circle signs once its owner approves with their PIN, so this carries the challenge
+    for the frame to run and the signature comes back from the frame.
+    """
+
+    app_id: str
+    user_token: str
+    encryption_key: str
+    challenge_id: str | None
+    signature: str | None
 
 
 class FundRequest(BaseModel):
@@ -473,51 +530,16 @@ class AlreadyPublished(BaseModel):
     """The open listing of that GitHub issue."""
 
 
-class SimulatedLink(BaseModel):
-    login: str = Field(min_length=1, max_length=39, pattern=r"^[A-Za-z0-9-]+$")
-
-
 class CriteriaRequest(BaseModel):
     criteria: list[str] = Field(min_length=1, max_length=12)
 
 
 class ClaimRequest(BaseModel):
-    contributor_id: str | None = None
-    """The simulation's only: whom the demo claims as. A signed-in contributor claims
-    as themselves."""
+    """Empty: a signed-in contributor claims as themselves."""
 
 
 class SubmitRequest(BaseModel):
     pr_number: int = Field(gt=0)
-
-
-class FinanceOut(BaseModel):
-    """A publisher's money as the pricing engine sees it, for that publisher alone (#43)."""
-
-    publisher_id: str
-    declared_budget_usdc: str
-    connected: bool
-    """Whether the operator connected this publisher's books."""
-    source: str | None = None
-    budget_remaining_usdc: str | None = None
-    """What the books say remains of the budget this work comes out of."""
-    cash_usdc: str | None = None
-    as_of: datetime | None = None
-    spendable_usdc: str
-    """The lower of the declared budget and what the books say remains.
-
-    Informational only since #142. It used to cap every price the publisher was
-    offered, which made their own money a one-way constraint on their own decision;
-    it now tells them what they have to spend and nothing else."""
-    note: str = ""
-
-
-class DemoPullRequestOut(BaseModel):
-    """A pull request the simulated GitHub opened for the claimant (simulation only)."""
-
-    pr_number: int
-    author: str
-    head_sha: str
 
 
 class PolicyRequest(BaseModel):
@@ -529,58 +551,7 @@ class PolicyRequest(BaseModel):
 
 
 class ApproveReleaseRequest(BaseModel):
-    approver: str | None = Field(default=None, min_length=1, max_length=200)
-    """The simulation's only, for a visitor who is not signed in: the approver the demo
-    acts as. Signed in, the approver is the account's linked GitHub login, and this is
-    ignored."""
-
-
-class SpendCategory(BaseModel):
-    label: str
-    committed: dict[str, str | int]
-    """Committed during the year."""
-    released: dict[str, str | int]
-    """Released during the year."""
-    committed_this_month: dict[str, str | int]
-    """Committed since this calendar month began: what the monthly limit is checked
-    against when the next commitment is funded."""
-    limit: dict[str, str | int] | None = None
-    """The most that may be committed under the label in one calendar month."""
-
-
-class FileableItem(BaseModel):
-    """One settled fix, with what a security review needs to file it."""
-
-    issue_id: str
-    repo: str
-    number: int
-    title: str
-    labels: list[str]
-    compliance_driven: bool
-    acceptance_criteria: list[str]
-    amount: dict[str, str | int]
-    settled_at: datetime
-    github_url: str
-
-
-class SpendOut(BaseModel):
-    """What an organisation budgeted, committed, released and can file (#50)."""
-
-    publisher_id: str
-    name: str
-    year: int
-    month: str
-    """The calendar month the `committed_this_month` figures count, as YYYY-MM (UTC)."""
-    budget_remaining: dict[str, str | int]
-    committed_held: dict[str, str | int]
-    """In escrow now, across every open issue."""
-    committed: dict[str, str | int]
-    """Committed during the year."""
-    released: dict[str, str | int]
-    refunded: dict[str, str | int]
-    by_category: list[SpendCategory]
-    fileable: list[FileableItem]
-    """Settled fixes that were compliance-driven or security-labelled."""
+    """Empty: the approver is the signed-in account's linked GitHub login."""
 
 
 class AuditMoneyEvent(BaseModel):
@@ -615,7 +586,6 @@ class AuditExport(BaseModel):
     publisher_id: str
     name: str
     generated_at: datetime
-    simulated: bool
     issues: list[AuditIssue]
 
 
@@ -634,30 +604,6 @@ class ReputationEventOut(BaseModel):
     settled_at: datetime
 
 
-class LoopSettlement(BaseModel):
-    issue_id: str
-    repo: str
-    number: int
-    title: str
-    amount: dict[str, str | int]
-    contributor: str
-    """The contributor's GitHub handle, which the settlement comment already shows."""
-    settled_at: datetime
-    github_url: str
-
-
-class LoopOut(BaseModel):
-    """The loop in public: what was funded, settled and paid, for one repository or
-    all of them. No wallet and no transfer appears here."""
-
-    repo: str | None
-    funded_open: int
-    settled_issues: int
-    settled_issues_7d: int
-    matched_volume_usdc: str
-    recent: list[LoopSettlement]
-
-
 class DisputeRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
     """Which criteria the contributor believes are met, and where the work shows it."""
@@ -669,24 +615,28 @@ class HealthOut(BaseModel):
     chain: str = Field(description="Derived from chain_id: arc-mainnet, arc-testnet or chain-<id>")
     chain_id: int
     network_label: str
-    money: Literal["simulated", "test", "real", "unknown"] = Field(
+    money: Literal["test", "real", "unknown"] = Field(
         description=(
-            "simulated: nothing moves; test: Arc testnet faucet USDC; real: Arc mainnet; "
+            "test: Arc testnet faucet USDC; real: Arc mainnet; "
             "unknown: not an Arc network, so treat its USDC as real"
         )
     )
     money_note: str
-    seeded_issues: int
-    simulated: bool
     github_oauth: bool = Field(
         description=(
             "Whether a real GitHub account can be linked here: both "
-            "MISTHOS_GITHUB_OAUTH_CLIENT_ID and MISTHOS_GITHUB_OAUTH_CLIENT_SECRET are set. "
-            "Without it, the simulation links a typed login and a deployment links none."
+            "MISTHOS_GITHUB_OAUTH_CLIENT_ID and MISTHOS_GITHUB_OAUTH_CLIENT_SECRET are set."
         )
     )
     github_oauth_callback_url: str = Field(
         description="The callback URL to register on the GitHub OAuth App, from MISTHOS_PUBLIC_URL"
+    )
+    circle_sign_in: bool = Field(
+        default=False,
+        description=(
+            "Whether a Circle wallet can be the way in (#181): the edge service is "
+            "configured, which MISTHOS_EDGE_CORE_TOKEN being set stands for."
+        ),
     )
 
 
@@ -720,83 +670,6 @@ class AnnualStatement(BaseModel):
     total: dict[str, str | int]
     payouts: int
     generated_at: datetime
-    simulated: bool
-    """True when no chain was contacted. A simulated statement is not a tax record."""
-
-
-# ------------------------------------------------------------------ plans (#53)
-
-
-class PlanOut(BaseModel):
-    id: Tier
-    name: str
-    audience: str
-    monthly_usdc: str
-    price_from: bool
-    """True when the price is where a negotiated one starts (Enterprise)."""
-    self_serve: bool
-    """Bought from the web app without a conversation."""
-    take_rate_percent: float
-    minimum_fix_usdc: str
-    features: list[str]
-    support: str
-
-
-class PaymentRequest(BaseModel):
-    """What to send to start or renew a plan: USDC on Arc, from the publisher's wallet."""
-
-    plan: Tier
-    amount_usdc: str
-    pay_to: str
-    payer: str
-    chain: str
-    chain_id: int
-    usdc_address: str
-    expires_at: datetime
-
-
-class Subscription(BaseModel):
-    publisher_id: str
-    plan: Tier
-    status: Literal["pending", "active", "past_due", "lapsed", "cancelled"]
-    """`pending` is chosen and not yet paid for."""
-    period_start: datetime | None = None
-    period_end: datetime | None = None
-    cancel_at_period_end: bool = False
-    pending: PaymentRequest | None = None
-    updated_at: datetime
-
-
-class SubscriptionPayment(BaseModel):
-    publisher_id: str
-    plan: Tier
-    amount_usdc: str
-    tx_hash: str
-    period_start: datetime
-    period_end: datetime
-    paid_at: datetime
-
-
-class SubscriptionOut(BaseModel):
-    publisher_id: str
-    plan: Tier
-    """The plan in force now, which is the publisher's tier."""
-    status: Literal["none", "pending", "active", "past_due", "lapsed", "cancelled", "contract"]
-    """`none` is Open with nothing bought; `contract` is a plan agreed with us."""
-    period_end: datetime | None = None
-    grace_ends: datetime | None = None
-    cancel_at_period_end: bool = False
-    pending: PaymentRequest | None = None
-    payments: list[SubscriptionPayment] = Field(default_factory=list)
-    features: list[str] = Field(default_factory=list)
-
-
-class SubscribeRequest(BaseModel):
-    plan: Tier
-
-
-class PaymentConfirmation(BaseModel):
-    tx_hash: str = Field(pattern=r"^0x[0-9a-fA-F]{64}$")
 
 
 # ------------------------------------------------------- GitHub connections (#6)
@@ -812,6 +685,21 @@ class RepoConnection(BaseModel):
     """The GitHub login that installed the App: the publisher, once that login is linked."""
     publisher_id: str | None = None
     connected_at: datetime
+
+
+class GitHubIssueOut(BaseModel):
+    """One open issue in a connected repository, for the publisher's picker (#199)."""
+
+    number: int
+    title: str
+    labels: list[str]
+    html_url: str
+    listed_issue_id: str | None = None
+    """The Misthos listing that already prices this issue, if one is open."""
+
+
+class GitHubIssuesOut(BaseModel):
+    issues: list[GitHubIssueOut]
 
 
 class RepositoriesOut(BaseModel):
@@ -830,3 +718,103 @@ class RepositoriesOut(BaseModel):
     GitHub's per-installation page is the only place a repository is added to or removed
     from an installation, so once something is connected this is what to offer instead
     of installing again. None when nothing is connected yet."""
+
+
+# ------------------------------------------------------------- paid API (#200)
+# What the edge and the core say to each other about x402 calls. None of this is
+# served to a buyer as is: the edge answers buyers, and these routes answer the edge.
+
+
+class PaidAccessAsked(BaseModel):
+    """Is this caller free on this paid route? Asked by the edge for a free-tier route."""
+
+    route: str = Field(max_length=64)
+    params: dict[str, str] = Field(default_factory=dict)
+    query: dict[str, str | list[str]] = Field(default_factory=dict)
+
+
+class PaidAccess(BaseModel):
+    free: bool
+    who: str | None = Field(
+        default=None,
+        description="The free caller as `role:party_id`, passed back on the call it makes",
+    )
+
+
+class PaidCallIn(BaseModel):
+    """One settlement, as the edge reports it once the call it paid for was answered."""
+
+    route: str = Field(min_length=1, max_length=64)
+    request_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payer: str = Field(pattern=r"^0x[0-9a-fA-F]{40}$")
+    amount_base_units: int = Field(gt=0)
+    network: str = Field(pattern=r"^eip155:\d+$")
+    asset: str = Field(pattern=r"^0x[0-9a-fA-F]{40}$")
+    transaction: str = Field(min_length=1, max_length=128)
+    ref: str | None = Field(default=None, max_length=64)
+
+
+class PaidCallOut(BaseModel):
+    id: str
+    route: str
+    request_digest: str
+    payer: str
+    amount: dict[str, str | int]
+    network: str
+    asset: str
+    transaction: str
+    ref: str | None
+    settled_at: datetime
+
+
+class PaidRouteTotal(BaseModel):
+    route: str
+    network: str
+    calls: int
+    amount: dict[str, str | int]
+
+
+class PaidCallsOut(BaseModel):
+    """The books of paid calls, to reconcile with Circle Gateway's balance for the seller."""
+
+    calls: list[PaidCallOut]
+    totals: list[PaidRouteTotal]
+    total: dict[str, str | int]
+
+
+# ------------------------------------------------------- the API page (#208)
+
+
+class PaidRouteOut(BaseModel):
+    """One x402 route the edge sells, as its catalog lists it."""
+
+    id: str
+    method: Literal["GET", "POST"]
+    path: str
+    price: dict[str, str]
+    """`usdc` and `base_units`, as the edge charges them."""
+    name: str
+    summary: str
+    group: Literal["Core", "Marketplace", "Analytics", "Trust"]
+    returns: str | None = None
+    free_tier: bool = False
+    is_async: bool = Field(default=False, alias="async")
+    capped: bool = False
+    note: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class PaidCatalogOut(BaseModel):
+    """What the edge sells over x402, read from the edge itself so its prices are the
+    ones charged. `available` is false when the edge could not be read."""
+
+    available: bool
+    base_url: str | None = Field(
+        description="Where buyers call the paid routes; MISTHOS_PAID_PUBLIC_URL"
+    )
+    networks: list[str] = Field(default_factory=list)
+    pay_to: str | None = None
+    asset: str | None = None
+    certificate_signer: str | None = None
+    routes: list[PaidRouteOut] = Field(default_factory=list)

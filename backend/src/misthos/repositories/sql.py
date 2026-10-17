@@ -6,8 +6,7 @@ rows follow the schema's rules. Proposals, submissions, verdicts and decisions a
 only ever inserted, the commitment mirror and the claim are updated in place, and an
 issue's current proposal, claim, submission and verdict are its newest rows.
 
-The simulation's reset swaps every row for the seed inside one transaction too, so a
-reader sees the old data or the seed and never the empty tables between. The version
+A save is one transaction, so a reader never sees half of it. The version
 column carries on climbing across it rather than starting again at 1, so a copy loaded
 before the reset is still refused after it.
 
@@ -17,7 +16,6 @@ needs no separate setup step and a deployment cannot run against an old schema.
 
 from __future__ import annotations
 
-import dataclasses
 import threading
 import zlib
 from collections import defaultdict
@@ -26,7 +24,18 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Connection, create_engine, delete, func, insert, select, text, update
+from sqlalchemy import (
+    Connection,
+    and_,
+    create_engine,
+    delete,
+    func,
+    insert,
+    or_,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
@@ -40,14 +49,13 @@ from misthos.domain.compliance import (
 from misthos.domain.issue import FundingTerms, IssueState
 from misthos.domain.ledger import MoneyEvent, MoneyEventKind
 from misthos.domain.money import Usdc, format_usdc
+from misthos.domain.paid import PaidCall, PaidReview, PriceQuote
 from misthos.domain.pricing import PriceProposal
 from misthos.models import tables as t
 from misthos.models.records import IssueRecord
 from misthos.repositories.base import (
     AccountConflict,
     AppendOnlyViolation,
-    PaymentAlreadyUsed,
-    Seed,
     StaleIssue,
 )
 from misthos.schemas import (
@@ -56,13 +64,10 @@ from misthos.schemas import (
     Contributor,
     Decision,
     EscrowCommitment,
-    PaymentRequest,
     Publisher,
     RepoConnection,
     Review,
     Submission,
-    Subscription,
-    SubscriptionPayment,
     Wallet,
     money,
 )
@@ -74,19 +79,6 @@ Row = Mapping[str, Any]
 # for the first time starts above it.
 _VERSION_FLOOR = "issue_version_floor"
 
-# What a reset empties, children first. The simulated chain's books share the
-# database but belong to the chain gateway, which resets them itself, before a seed
-# is built against them.
-_RESET_TABLES = [
-    table
-    for table in reversed(t.metadata.sorted_tables)
-    if table not in (t.simulated_escrow, t.simulated_escrow_ceilings)
-]
-# The order a reset locks them in under Postgres. Every save takes its issue row
-# before any other, so the reset takes issues first too and never holds a table a
-# save in flight still needs; publishers and contributors, which other rows point
-# at, come last, as they do in every transaction that touches them.
-_RESET_LOCK_ORDER = [t.issues, *(table for table in _RESET_TABLES if table is not t.issues)]
 
 
 def normalise_url(url: str) -> str:
@@ -117,37 +109,6 @@ class SqlRepository:
 
                 upgrade_to_head(self.engine)
                 self._schema_ready = True
-
-    def reset(self, seed: Seed | None = None) -> None:
-        self.migrate()
-        with self.engine.begin() as conn:
-            if conn.dialect.name == "postgresql":
-                # Writers wait for the reset rather than interleave with it, which
-                # deadlocked a save holding an issue the reset was about to delete.
-                # Readers are not held up, and see the old rows until the commit.
-                quote = conn.dialect.identifier_preparer.quote
-                names = ", ".join(quote(table.name) for table in _RESET_LOCK_ORDER)
-                conn.execute(text(f"LOCK TABLE {names} IN EXCLUSIVE MODE"))
-            floor = _version_floor(conn)
-            for table in _RESET_TABLES:
-                if table is t.issues:
-                    # The versions of the rows actually deleted, so one an action saved
-                    # a moment before the reset is counted too.
-                    gone = conn.execute(delete(table).returning(table.c.version)).scalars()
-                    floor = max([floor, *gone])
-                elif table is t.counters:
-                    conn.execute(delete(table).where(table.c.name != _VERSION_FLOOR))
-                else:
-                    conn.execute(delete(table))
-            _upsert(conn, t.counters, {"name": _VERSION_FLOOR}, {"value": floor})
-            if seed is not None:
-                _write_seed(conn, seed, floor)
-
-    def is_empty(self) -> bool:
-        self.migrate()
-        with self.engine.connect() as conn:
-            publishers = conn.execute(select(func.count()).select_from(t.publishers))
-            return publishers.scalar_one() == 0
 
     def next_value(self, counter: str, start: int) -> int:
         self.migrate()
@@ -292,9 +253,40 @@ class SqlRepository:
         }
         try:
             with self.engine.begin() as conn:
+                if account.github_login:
+                    _refuse_taken(conn, account.address, account.github_login)
                 _upsert(conn, t.accounts, {"address": account.address.lower()}, values)
         except IntegrityError as exc:
             raise AccountConflict(f"{account.github_login} is linked to another wallet") from exc
+
+    def get_pending_github_login(self, address: str) -> str | None:
+        self.migrate()
+        with self.engine.connect() as conn:
+            return conn.execute(
+                select(t.pending_github_links.c.github_login).where(
+                    t.pending_github_links.c.address == address.lower()
+                )
+            ).scalar_one_or_none()
+
+    def hold_github_login(self, address: str, login: str, at: datetime) -> None:
+        self.migrate()
+        values = {"github_login": login, "login_key": login.lower(), "held_at": at}
+        try:
+            with self.engine.begin() as conn:
+                _refuse_taken(conn, address, login)
+                _upsert(conn, t.pending_github_links, {"address": address.lower()}, values)
+        except IntegrityError as exc:
+            # Another wallet held it between the check and the write.
+            raise AccountConflict(f"{login} is being linked by another wallet") from exc
+
+    def drop_pending_github_login(self, address: str) -> None:
+        self.migrate()
+        with self.engine.begin() as conn:
+            conn.execute(
+                delete(t.pending_github_links).where(
+                    t.pending_github_links.c.address == address.lower()
+                )
+            )
 
     # ---------------------------------------------------------- GitHub connections
 
@@ -350,85 +342,6 @@ class SqlRepository:
             rows = conn.execute(select(t.repo_connections)).mappings().all()
         return [_connection(r) for r in rows]
 
-    # ---------------------------------------------------------- plans
-
-    def get_subscription(self, publisher_id: str) -> Subscription | None:
-        self.migrate()
-        with self.engine.connect() as conn:
-            row = (
-                conn.execute(
-                    select(t.subscriptions).where(t.subscriptions.c.publisher_id == publisher_id)
-                )
-                .mappings()
-                .first()
-            )
-        return _subscription(row) if row is not None else None
-
-    def save_subscription(self, subscription: Subscription) -> None:
-        self.migrate()
-        values = {
-            "plan": subscription.plan,
-            "status": subscription.status,
-            "period_start": subscription.period_start,
-            "period_end": subscription.period_end,
-            "cancel_at_period_end": subscription.cancel_at_period_end,
-            "pending": subscription.pending.model_dump(mode="json")
-            if subscription.pending
-            else None,
-            "updated_at": subscription.updated_at,
-        }
-        with self.engine.begin() as conn:
-            _upsert(conn, t.subscriptions, {"publisher_id": subscription.publisher_id}, values)
-
-    def list_subscriptions(self) -> list[Subscription]:
-        self.migrate()
-        with self.engine.connect() as conn:
-            rows = conn.execute(select(t.subscriptions)).mappings().all()
-        return [_subscription(r) for r in rows]
-
-    def add_subscription_payment(self, payment: SubscriptionPayment) -> None:
-        self.migrate()
-        try:
-            with self.engine.begin() as conn:
-                conn.execute(
-                    insert(t.subscription_payments).values(
-                        publisher_id=payment.publisher_id,
-                        plan=payment.plan,
-                        amount_base_units=Usdc.from_decimal(payment.amount_usdc).base_units,
-                        tx_hash=payment.tx_hash.lower(),
-                        period_start=payment.period_start,
-                        period_end=payment.period_end,
-                        paid_at=payment.paid_at,
-                    )
-                )
-        except IntegrityError as exc:
-            raise PaymentAlreadyUsed(payment.tx_hash) from exc
-
-    def list_subscription_payments(self, publisher_id: str) -> list[SubscriptionPayment]:
-        self.migrate()
-        with self.engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    select(t.subscription_payments)
-                    .where(t.subscription_payments.c.publisher_id == publisher_id)
-                    .order_by(t.subscription_payments.c.id)
-                )
-                .mappings()
-                .all()
-            )
-        return [
-            SubscriptionPayment(
-                publisher_id=r["publisher_id"],
-                plan=r["plan"],
-                amount_usdc=str(Usdc(r["amount_base_units"]).decimal),
-                tx_hash=r["tx_hash"],
-                period_start=_utc(r["period_start"]),
-                period_end=_utc(r["period_end"]),
-                paid_at=_utc(r["paid_at"]),
-            )
-            for r in rows
-        ]
-
     # ---------------------------------------------------------- deliveries
 
     def record_delivery(self, delivery_id: str, event: str, at: datetime) -> bool:
@@ -470,11 +383,6 @@ class SqlRepository:
         with self.engine.connect() as conn:
             return _load(conn, conn.execute(query).mappings().all())
 
-    def count_issues(self) -> int:
-        self.migrate()
-        with self.engine.connect() as conn:
-            return conn.execute(select(func.count()).select_from(t.issues)).scalar_one()
-
     def save_issues(self, *records: IssueRecord) -> None:
         self.migrate()
         with self.engine.begin() as conn:
@@ -491,6 +399,181 @@ class SqlRepository:
             .order_by(t.decisions.c.created_at.desc(), t.decisions.c.id.desc())
             .limit(limit)
         )
+        with self.engine.connect() as conn:
+            return [_decision(r) for r in conn.execute(query).mappings()]
+
+    # ---------------------------------------------------------- paid calls
+
+    def record_paid_call(self, call: PaidCall) -> PaidCall:
+        self.migrate()
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    insert(t.paid_calls).values(
+                        id=call.id,
+                        route=call.route,
+                        request_digest=call.request_digest,
+                        payer=call.payer,
+                        amount_base_units=call.amount.base_units,
+                        network=call.network,
+                        asset=call.asset,
+                        transaction=call.transaction,
+                        ref=call.ref,
+                        settled_at=call.settled_at,
+                    )
+                )
+        except IntegrityError:
+            query = select(t.paid_calls).where(
+                t.paid_calls.c.route == call.route,
+                t.paid_calls.c.request_digest == call.request_digest,
+                t.paid_calls.c.transaction == call.transaction,
+            )
+            with self.engine.connect() as conn:
+                row = conn.execute(query).mappings().first()
+            if row is None:
+                raise
+            return _paid_call(row)
+        return call
+
+    def get_paid_call(self, call_id: str) -> PaidCall | None:
+        self.migrate()
+        with self.engine.connect() as conn:
+            query = select(t.paid_calls).where(t.paid_calls.c.id == call_id)
+            row = conn.execute(query).mappings().first()
+        return _paid_call(row) if row else None
+
+    def list_paid_calls(
+        self, *, since: datetime | None = None, route: str | None = None, limit: int = 500
+    ) -> list[PaidCall]:
+        self.migrate()
+        query = select(t.paid_calls)
+        if since is not None:
+            query = query.where(t.paid_calls.c.settled_at >= since)
+        if route is not None:
+            query = query.where(t.paid_calls.c.route == route)
+        newest = (t.paid_calls.c.settled_at.desc(), t.paid_calls.c.id.desc())
+        query = query.order_by(*newest).limit(limit)
+        with self.engine.connect() as conn:
+            return [_paid_call(r) for r in conn.execute(query).mappings()]
+
+    def record_price_quote(self, quote: PriceQuote) -> None:
+        self.migrate()
+        with self.engine.begin() as conn:
+            conn.execute(
+                insert(t.price_quotes).values(
+                    id=quote.id,
+                    route=quote.route,
+                    request_digest=quote.request_digest,
+                    payer=quote.payer,
+                    free_caller=quote.free_caller,
+                    inputs=quote.inputs,
+                    output=quote.output,
+                    quoted_at=quote.quoted_at,
+                )
+            )
+
+    def list_price_quotes(self, limit: int = 500) -> list[PriceQuote]:
+        self.migrate()
+        q = t.price_quotes.c
+        query = select(t.price_quotes).order_by(q.quoted_at.desc(), q.id.desc()).limit(limit)
+        with self.engine.connect() as conn:
+            return [
+                PriceQuote(
+                    id=r["id"],
+                    route=r["route"],
+                    request_digest=r["request_digest"],
+                    payer=r["payer"],
+                    free_caller=r["free_caller"],
+                    inputs=dict(r["inputs"]),
+                    output=dict(r["output"]),
+                    quoted_at=_utc(r["quoted_at"]),
+                )
+                for r in conn.execute(query).mappings()
+            ]
+
+    def save_paid_review(self, review: PaidReview) -> None:
+        self.migrate()
+        values = {
+            "status": review.status,
+            "request_digest": review.request_digest,
+            "payer": review.payer,
+            "free_caller": review.free_caller,
+            "repo": review.repo,
+            "title": review.title,
+            "criteria": review.criteria,
+            "files": review.files,
+            "additions": review.additions,
+            "deletions": review.deletions,
+            "created_at": review.created_at,
+            "started_at": review.started_at,
+            "finished_at": review.finished_at,
+            "verdict": review.verdict,
+            "rule": review.rule,
+            "reviewer": review.reviewer,
+            "seconds": review.seconds,
+            "cost_base_units": review.cost.base_units if review.cost else None,
+            "result": review.result,
+            "error": review.error,
+        }
+        with self.engine.begin() as conn:
+            _upsert(conn, t.paid_reviews, {"id": review.id}, values)
+
+    def get_paid_review(self, review_id: str) -> PaidReview | None:
+        self.migrate()
+        query = select(t.paid_reviews).where(t.paid_reviews.c.id == review_id)
+        with self.engine.connect() as conn:
+            r = conn.execute(query).mappings().first()
+        if r is None:
+            return None
+        return PaidReview(
+            id=r["id"],
+            status=r["status"],
+            request_digest=r["request_digest"],
+            payer=r["payer"],
+            free_caller=r["free_caller"],
+            repo=r["repo"],
+            title=r["title"],
+            criteria=r["criteria"],
+            files=r["files"],
+            additions=r["additions"],
+            deletions=r["deletions"],
+            created_at=_utc(r["created_at"]),
+            started_at=_utc_or_none(r["started_at"]),
+            finished_at=_utc_or_none(r["finished_at"]),
+            verdict=r["verdict"],
+            rule=r["rule"],
+            reviewer=r["reviewer"],
+            seconds=r["seconds"],
+            cost=Usdc(int(r["cost_base_units"])) if r["cost_base_units"] is not None else None,
+            result=dict(r["result"]),
+            error=r["error"],
+        )
+
+    def page_decisions(
+        self,
+        *,
+        after: tuple[datetime, str] | None = None,
+        limit: int = 50,
+        issue_id: str | None = None,
+        actor: str | None = None,
+        action: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[Decision]:
+        self.migrate()
+        d = t.decisions.c
+        query = select(t.decisions)
+        if after is not None:
+            at, last = after
+            query = query.where(or_(d.created_at > at, and_(d.created_at == at, d.id > last)))
+        for column, value in ((d.issue_id, issue_id), (d.actor, actor), (d.action, action)):
+            if value is not None:
+                query = query.where(column == value)
+        if since is not None:
+            query = query.where(d.created_at >= since)
+        if until is not None:
+            query = query.where(d.created_at < until)
+        query = query.order_by(d.created_at, d.id).limit(limit)
         with self.engine.connect() as conn:
             return [_decision(r) for r in conn.execute(query).mappings()]
 
@@ -530,24 +613,10 @@ def _version_floor(conn: Connection) -> int:
     return int(found or 0)
 
 
-def _write_seed(conn: Connection, seed: Seed, floor: int) -> None:
-    for publisher in seed.publishers:
-        _upsert(conn, t.publishers, {"id": publisher.id}, _publisher_values(publisher))
-    for contributor in seed.contributors:
-        _upsert(conn, t.contributors, {"id": contributor.id}, _contributor_values(contributor))
-    for rec in seed.issues:
-        # New rows here, numbered from the floor like any issue saved for the first time.
-        _save(conn, dataclasses.replace(rec, version=0), floor)
-    for name, value in seed.counters.items():
-        if name != _VERSION_FLOOR:
-            _upsert(conn, t.counters, {"name": name}, {"value": value})
-
-
 def _publisher_values(publisher: Publisher) -> dict[str, Any]:
     return {
         "name": publisher.name,
         "kind": publisher.kind,
-        "tier": publisher.tier,
         "wallet_address": publisher.wallet.address,
         "chain": publisher.wallet.chain,
         "budget_remaining_base_units": _parse_usdc(publisher.budget_remaining_usdc).base_units,
@@ -805,6 +874,31 @@ def _upsert(conn: Connection, table: Any, key: dict[str, Any], values: dict[str,
         conn.execute(insert(table).values(**key, **values))
 
 
+def _refuse_taken(conn: Connection, address: str, login: str) -> None:
+    """One login, one wallet: linked on an account or held for one, whatever its case.
+
+    Checked inside the writing transaction. The unique keys on both tables still catch
+    two writers racing on the same table; the store also holds the login for the write,
+    so a hold and a link of the same login on different tables do not interleave.
+    """
+    address, wanted = address.lower(), login.lower()
+    linked = conn.execute(
+        select(t.accounts.c.address).where(
+            func.lower(t.accounts.c.github_login) == wanted, t.accounts.c.address != address
+        )
+    ).first()
+    if linked is not None:
+        raise AccountConflict(f"{login} is linked to another wallet")
+    held = conn.execute(
+        select(t.pending_github_links.c.address).where(
+            t.pending_github_links.c.login_key == wanted,
+            t.pending_github_links.c.address != address,
+        )
+    ).first()
+    if held is not None:
+        raise AccountConflict(f"{login} is being linked by another wallet")
+
+
 def _exists(conn: Connection, table: Any, key: dict[str, Any]) -> bool:
     where = [table.c[k] == v for k, v in key.items()]
     return conn.execute(select(func.count()).select_from(table).where(*where)).scalar_one() > 0
@@ -927,7 +1021,6 @@ def _publisher(row: Row) -> Publisher:
         id=row["id"],
         name=row["name"],
         kind=row["kind"],
-        tier=row["tier"],
         wallet=Wallet(address=row["wallet_address"], chain=row["chain"]),
         budget_remaining_usdc=format_usdc(Usdc(row["budget_remaining_base_units"])),
         approval_threshold_usdc=(
@@ -1001,19 +1094,6 @@ def _connection(row) -> RepoConnection:  # type: ignore[no-untyped-def]
         installed_by=row["installed_by"],
         publisher_id=row["publisher_id"],
         connected_at=_utc(row["connected_at"]),
-    )
-
-
-def _subscription(row) -> Subscription:  # type: ignore[no-untyped-def]
-    return Subscription(
-        publisher_id=row["publisher_id"],
-        plan=row["plan"],
-        status=row["status"],
-        period_start=_utc_or_none(row["period_start"]),
-        period_end=_utc_or_none(row["period_end"]),
-        cancel_at_period_end=row["cancel_at_period_end"],
-        pending=PaymentRequest(**row["pending"]) if row["pending"] else None,
-        updated_at=_utc(row["updated_at"]),
     )
 
 
@@ -1098,4 +1178,19 @@ def _money_event(row: Row) -> MoneyEvent:
         counterparty_id=row["counterparty_id"],
         tx_hash=row["tx_hash"],
         occurred_at=_utc(row["occurred_at"]),
+    )
+
+
+def _paid_call(row: Row) -> PaidCall:
+    return PaidCall(
+        id=row["id"],
+        route=row["route"],
+        request_digest=row["request_digest"],
+        payer=row["payer"],
+        amount=Usdc(int(row["amount_base_units"])),
+        network=row["network"],
+        asset=row["asset"],
+        transaction=row["transaction"],
+        ref=row["ref"],
+        settled_at=_utc(row["settled_at"]),
     )

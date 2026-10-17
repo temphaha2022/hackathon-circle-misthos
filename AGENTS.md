@@ -18,10 +18,9 @@ reviews the pull request against the acceptance criteria, and payment settles in
   bounds in `domain/pricing.py` — a minimum of **$5**, which is an anti-typo and anti-spam
   floor rather than a break-even solve, and a maximum of $100,000. The publisher can move
   the price while the issue is unfunded and unclaimed, and no further.
-- **The fee is a flat 10 percent** of the committed amount, on every plan
-  (`PLATFORM_FEE_BPS = 1000`). It is carved out at settlement by `MisthosEscrow.release`,
-  bounded there at 15 percent, and refunded in full if the issue never settles. Plans gate
-  features, never the rate.
+- **The fee is a flat 10 percent** of the committed amount (`PLATFORM_FEE_BPS = 1000`).
+  It is carved out at settlement by `MisthosEscrow.release`, bounded there at 15 percent,
+  and refunded in full if the issue never settles. There is no plan and nothing is gated.
 - **The platform owns review.** There is no third-party reviewer and no review fee. The
   review agent's verdict is the verdict. The publisher's merge is the only human
   signature on release, with a seven-day grace period if they go quiet.
@@ -41,20 +40,19 @@ reviews the pull request against the acceptance criteria, and payment settles in
 
 ### Current status
 
-A scaffold with a working simulation. The lifecycle, pricing engine, escrow contract,
-decision log, money ledger and its timers are real code; by default the money is
-fake — no chain is contacted, and the escrow is a simulated one behind the chain
-gateway. With `MISTHOS_SIMULATED=false` the same gateway settles against the deployed
-`MisthosEscrow` on Arc (docs/DEPLOY.md §3). GitHub is
-simulated too unless a GitHub App is configured (`MISTHOS_GITHUB_APP_ID`), in which
-case issues are read and pull request events move the lifecycle for real. State is in memory unless `MISTHOS_DATABASE_URL` points at Postgres, and the
-per-issue lock, idempotency keys and rate limits are per process unless
-`MISTHOS_REDIS_URL` points at Redis.
-Do not assume a live integration because a module names one.
+The app runs live, and only live. The lifecycle, pricing engine, escrow contract,
+decision log, money ledger and its timers are real code, and the chain gateway
+settles against the deployed `MisthosEscrow` on Arc (docs/DEPLOY.md §3). The process
+refuses to start without the escrow record, a GitHub App (`MISTHOS_GITHUB_APP_ID` and
+its private key) and the signing-key references. Compliance uses real providers:
+Stripe Identity for a contributor's first payout and the official OFAC SDN list for
+screening; without a Stripe key a first payout stays pending. State is in memory
+unless `MISTHOS_DATABASE_URL` points at Postgres, and the per-issue lock, idempotency
+keys and rate limits are per process unless `MISTHOS_REDIS_URL` points at Redis.
 
 ## Project layout
 
-Four code folders, one per runtime boundary. State that crosses a boundary crosses over
+Five code folders, one per runtime boundary. State that crosses a boundary crosses over
 HTTP or a contract, never by importing across folders.
 
 ```
@@ -64,7 +62,8 @@ backend/     Python 3.11: FastAPI API, pure domain, agents, workers
              tests/{unit,integration}/
 frontend/    Vite + React SPA, typed client generated from the API schema
              src/{routes,components,lib}/
-edge/        Node + Express: x402 payment gate and Circle CLI wallet bridge
+edge/        Node + Express: the x402 seller (the paid API) and Circle wallet bridge
+mcp/         Node: the buyer-side MCP server that pays for the paid API, with a cap
 contracts/   Foundry: MisthosEscrow on Arc
              src/ test/ script/
 docs/        Business documentation (misthos/) and architecture
@@ -106,32 +105,33 @@ mise run dev             # FastAPI :8000 + Vite :5173
 mise run dev:api         # backend only
 mise run dev:web         # frontend only
 mise run dev:edge        # edge service :8080
-mise run test            # backend + web + contracts
+mise run dev:mcp         # the buyer-side MCP server, over stdio
+mise run test            # every suite
 mise run test:backend    # pytest
 mise run test:web        # vitest
 mise run test:edge       # node --test
+mise run test:mcp        # node --test
 mise run test:contracts  # forge test
-mise run lint            # ruff + tsc for both TS packages + stale-ABI check
+mise run lint            # ruff + tsc for every TS package + stale-ABI check
 mise run abi:contracts   # re-export MisthosEscrow's ABI after a contract change
 mise run codegen         # regenerate frontend API types from the live schema
-mise run reset           # restore the seeded simulation data
 ```
 
 `setup:<runtime>`, `lint:<runtime>` and `test:<runtime>` exist for one runtime at a
-time; the unqualified tasks are the four of them together.
+time; the unqualified tasks are all of them together.
 
 Prefer the `mise run` task over the underlying command so the tool versions match. Run
 `mise run lint` and the relevant `mise run test:*` before calling a change done.
 
 ## Continuous integration
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every pull request, in four
-jobs, one per runtime: `ruff` and `pytest`, then `tsc` and `vitest`, then the edge
-`tsc` and `node --test`, then `forge test`. Each job installs only its own dependencies through
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every pull request, in one
+job per runtime: `ruff` and `pytest`, then `tsc` and `vitest`, then the edge's and the
+MCP server's `tsc` and `node --test`, then `forge test`. Each job installs only its own dependencies through
 `mise run setup:<runtime>`, so a failure names the runtime it came from.
 
-`mise run ci` is the same thing locally. `MISTHOS_SIMULATED=true` is pinned in the
-workflow: CI must never reach a chain, Circle or GitHub.
+`mise run ci` is the same thing locally. CI never reaches a chain, Circle or GitHub:
+the tests inject in-memory gateways at those boundaries.
 
 
 ## Coding conventions
@@ -158,7 +158,7 @@ trim trailing whitespace (Markdown excluded).
 - Pydantic v2 models for all request and response shapes in
   [schemas.py](backend/src/misthos/schemas.py).
 - Settings come from `Settings` in [config.py](backend/src/misthos/config.py), env prefix
-  `MISTHOS_`, every value with a safe default so the demo runs with no config.
+  `MISTHOS_`, every value a local run and a deployment must supply named here.
 - Tests: `pytest` with `asyncio_mode = "auto"`. Unit tests for domain logic in
   `tests/unit/`, API tests via `httpx` in `tests/integration/`. Name tests as
   behaviour sentences, in the project's plain voice.
@@ -193,6 +193,11 @@ trim trailing whitespace (Markdown excluded).
   Circle CLI bridge). Business logic belongs in the Python backend.
 - Local `node --test` for tests. Return the module's `app` as a default export and only
   `listen()` when `NODE_ENV !== 'test'`.
+
+### TypeScript — MCP server (`mcp/`)
+
+- The edge's conventions. It is a buyer, not a service: it never imports from `edge/`,
+  and its tests run against a fake seller, never the network.
 
 ### Solidity (`contracts/`)
 
@@ -231,8 +236,8 @@ trim trailing whitespace (Markdown excluded).
 - **Lifecycle state has a single writer.** Do not add a second code path that mutates
   issue state (webhook handler included); go through the lifecycle service so every
   transition gets a decision-log entry.
-- Anything that hits a blockchain must respect the `MISTHOS_SIMULATED` flag and stay
-  offline by default.
+- Anything that hits a blockchain settles against the deployed escrow. Tests inject an
+  in-memory chain gateway; shipped code has no offline mode.
 - Configuration goes in the relevant `.env.example` with a comment; **never commit a
   real `.env`, key or address-with-funds**. Lockfiles are committed — do not gitignore
   them.

@@ -1,6 +1,7 @@
 """Settings.
 
-Everything has a safe default so the demo runs with no configuration at all.
+A deployment names its chain, its GitHub App and its keys here. Values without a
+safe production default are refused at startup rather than guessed at.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="MISTHOS_", env_file=".env", extra="ignore")
 
     app_name: str = "Misthos"
-    simulated: bool = True
     # The network's name, and whether its money is real, follow from the chain id;
     # there is deliberately no separate label to set. See `network` below.
     chain_id: int = 5042002
@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     explorer_url: str = "https://explorer.testnet.arc.io"
     # Where `mise run contracts:deploy` recorded MisthosEscrow. Empty means the record
     # for `chain_id` under contracts/deployments/. An explicit `escrow_contract` wins.
-    # With neither, only the simulation runs, under a placeholder labelled as such.
+    # With neither the process refuses to start.
     escrow_deployment_file: str = ""
     escrow_contract: str = ""
     usdc_address: str = "0x3600000000000000000000000000000000000000"
@@ -30,13 +30,13 @@ class Settings(BaseSettings):
 
     github_webhook_secret: str = "dev-secret"
     # The GitHub App. With both set, the platform reads issues and repositories and
-    # posts criteria, reviews and statuses as the App; empty keeps GitHub simulated.
+    # posts criteria, reviews and statuses as the App. Both are required.
     # The key is the App's PEM private key; escaped newlines (\n) are accepted.
     github_app_id: str = ""
     github_app_private_key: str = ""
     github_api_url: str = "https://api.github.com"
     # Linking a user's own GitHub account (#80): the App's OAuth client credentials.
-    # Empty keeps linking simulated.
+    # Empty means linking is not offered.
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
 
@@ -46,26 +46,21 @@ class Settings(BaseSettings):
     public_url: str = "http://localhost:5173"
     session_secret: str = ""
 
-    # A publisher's books, read-only, for the affordability ceiling (#43). JSON from
-    # publisher id to a connection; see services/finance. Empty uses the declared
-    # budget alone.
-    finance_connections: str = ""
-
-    # Plans (#53). Where subscription payments are sent: the platform's own wallet on
-    # Arc. The simulation uses a made-up one when this is empty; anywhere else plans
-    # cannot be bought until it is set.
-    platform_wallet: str = ""
-
     # GitHub, driven from the repository (#6): an issue given this label, in a repository
     # a publisher installed the App on, is priced without opening the web app.
     github_label: str = "misthos"
     # The App's slug on github.com, for the web app's "install on a repository" link.
     github_app_slug: str = ""
     circle_api_key: str = ""
-    # The edge service holds the Circle wallet SDK. The token proves a call came
-    # from the core; the edge refuses wallet routes without it.
+    # The edge service holds the Circle wallet SDK and sells the paid API. The token
+    # proves a call came from the core, and one to the core came from the edge: the
+    # edge refuses wallet routes without it, and the internal paid routes answer 404.
     edge_url: str = "http://127.0.0.1:8080"
     edge_core_token: str = ""
+    # Where buyers reach the edge's paid API from outside, such as
+    # https://paid.example.com. Shown on the web app's API page; `edge_url` is the
+    # address the core uses inside the network, and is never shown.
+    paid_public_url: str = ""
 
     # The review agent. With a key, a model judges each pull request against its
     # acceptance criteria; without one, the rule reviewer judges what the file list
@@ -83,22 +78,25 @@ class Settings(BaseSettings):
     # A disputed verdict is reviewed again by this model; empty uses review_model.
     review_dispute_model: str = ""
 
-    # Empty keeps state in memory: the zero-config demo, reset on every restart. A
+    # Empty keeps state in memory, lost on restart. A
     # Postgres URL makes it durable, and sqlite:///path does the same in a local file.
     database_url: str = ""
-    # The simulation's reset deletes every row of that database, and anyone who can
-    # reach the API can ask for it, so it is refused while a database is configured
-    # unless this is set. Set it only where the database is a throwaway demo.
-    allow_demo_reset: bool = False
     # The sweeper applies claim expiry, deadline refunds and the silent-publisher
     # release on a timer. It runs inside the API by default; turn this off where a
     # dedicated `python -m misthos.workers` process runs it instead.
     sweeper_in_process: bool = True
     sweep_interval_seconds: float = 60.0
 
-    # Wallets the simulated sanctions screening treats as listed, comma separated. A
-    # real screening provider replaces the simulated one; this is for demos and tests.
-    screening_denylist: str = ""
+    # Compliance. Identity verification is Stripe Identity; sanctions screening reads
+    # the official OFAC SDN list. Both are real providers. Without the Stripe key a
+    # first payout stays pending and is not paid.
+    stripe_secret_key: str = ""
+    stripe_api_url: str = "https://api.stripe.com"
+    ofac_sdn_url: str = (
+        "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN.XML"
+    )
+    ofac_refresh_seconds: int = 86_400
+    ofac_cache_path: str = ""
 
     # Logging and metrics. JSON lines for a log pipeline, plain text for a terminal.
     log_json: bool = False
@@ -122,13 +120,21 @@ class Settings(BaseSettings):
     # The escrow owner's key, which records each approved price as the escrow's
     # ceiling (#34). Also a reference into the secret store, never the key.
     owner_secret_ref: str = ""
+    # The key that signs the paid API's certificates: escrow attestations and
+    # settlement receipts (#202). A reference into the secret store, like the two
+    # above, and a different key from both: it vouches for what the escrow holds and
+    # can move nothing. Unset, the signed routes answer 503 and nobody is charged.
+    certificate_secret_ref: str = ""
+    # The paid sanctions screen (#206). Off until the screening provider's terms and a
+    # legal review allow reselling its answers; until then it answers 503.
+    paid_screening_enabled: bool = False
     # A mounted directory holding the referenced keys, one file each, mode 600. For
     # local testing and anvil; a production deployment supplies its managed store.
     secret_store_dir: str = ""
 
     @property
     def network(self) -> Network:
-        return network_for(self.chain_id, simulated=self.simulated)
+        return network_for(self.chain_id)
 
     @property
     def chain(self) -> str:

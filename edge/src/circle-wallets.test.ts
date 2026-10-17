@@ -6,6 +6,7 @@ import {
   ARC_TESTNET,
   circleUserId,
   createWalletService,
+  signInUserId,
   walletConfig,
   type CircleUsers,
   type WalletConfig,
@@ -13,7 +14,6 @@ import {
 import { walletRouter } from './wallet-routes.js'
 
 const LIVE: WalletConfig = {
-  simulated: false,
   apiKey: 'TEST_API_KEY:x:y',
   appId: 'app-1',
   blockchain: ARC_TESTNET,
@@ -45,39 +45,41 @@ function fakeCircle(existing: Record<string, string> = {}) {
       const address = existing[userId]
       return { data: { wallets: address ? [{ address, blockchain: ARC_TESTNET }] : [] } }
     },
+    async signMessage(input) {
+      calls.push(`signMessage ${input.walletAddress} ${input.blockchain} ${input.encodedByHex}`)
+      return { data: { challengeId: 'sign-challenge-1' } }
+    },
   }
   return { circle, calls }
 }
 
+const SIGN_IN = 'browser-7f3a9c2e5b1d4e8f'
+const SIGN_IN_USER = `misthos-signin-${SIGN_IN}`
+
+/** A sign-in message as the web app builds it, naming `address` on its second line. */
+function signInMessage(address: string): string {
+  return [
+    'localhost:5173 wants you to sign in with your Ethereum account:',
+    address,
+    '',
+    'Sign in to Misthos. This costs nothing and moves no money.',
+    '',
+    'URI: http://localhost:5173',
+    'Version: 1',
+    'Chain ID: 5042002',
+    'Nonce: 0123456789abcdef01234567',
+    'Issued At: 2026-10-16T00:00:00.000Z',
+  ].join('\n')
+}
+
 describe('wallet configuration', () => {
-  it('is simulated and on Arc testnet unless told otherwise', () => {
-    const config = walletConfig({})
-    assert.equal(config.simulated, true)
-    assert.equal(config.blockchain, ARC_TESTNET)
-  })
-
-  it('refuses real wallets without Circle credentials', () => {
-    assert.throws(() => walletConfig({ MISTHOS_SIMULATED: 'false' }), /CIRCLE_API_KEY/)
-  })
-
-  // The API reads `0`, `no` and `off` as live. Read as simulated here, they gave the
-  // live API made-up addresses to keep as payout wallets.
-  it('is live for every spelling the API reads as live, and then needs Circle', () => {
-    for (const value of ['0', 'f', 'n', 'no', 'off', 'False', 'OFF']) {
-      assert.equal(walletConfig({ MISTHOS_SIMULATED: value, ...CREDENTIALS }).simulated, false, value)
-      assert.throws(() => walletConfig({ MISTHOS_SIMULATED: value }), /CIRCLE_API_KEY/, value)
-    }
-  })
-
-  it('refuses a MISTHOS_SIMULATED the API would refuse', () => {
-    for (const value of ['', 'maybe', ' false']) {
-      assert.throws(() => walletConfig({ MISTHOS_SIMULATED: value }), /MISTHOS_SIMULATED/, value)
-    }
+  it('is on Arc testnet by default and needs Circle credentials', () => {
+    assert.throws(() => walletConfig({}), /CIRCLE_API_KEY/)
+    assert.equal(walletConfig({ ...CREDENTIALS }).blockchain, ARC_TESTNET)
   })
 
   it('refuses mainnet wallets until the confirmation names chain 5042', () => {
     const env = {
-      MISTHOS_SIMULATED: 'false',
       CIRCLE_API_KEY: 'k',
       CIRCLE_APP_ID: 'a',
       CIRCLE_WALLET_BLOCKCHAIN: 'ARC',
@@ -127,23 +129,75 @@ describe('live wallet service', () => {
   })
 })
 
-describe('simulated wallet service', () => {
-  it('gives each party a stable address and never a challenge', async () => {
-    const service = createWalletService(walletConfig({}))
-    const first = await service.session('contributor', 'CON-1')
-    const again = await service.wallet('contributor', 'CON-1')
-    const other = await service.wallet('contributor', 'CON-2')
-
-    assert.equal(first.challengeId, null)
-    assert.match(first.address ?? '', /^0x[0-9a-f]{40}$/)
-    assert.equal(first.address, again.address)
-    assert.notEqual(first.address, other.address)
+describe('signing in with a Circle wallet', () => {
+  it('keys the Circle user by the sign-in id and refuses an id too short to be random', () => {
+    assert.equal(signInUserId(SIGN_IN), SIGN_IN_USER)
+    assert.throws(() => signInUserId('short'), /invalid/)
+    assert.throws(() => signInUserId('../../admin/please'), /invalid/)
   })
+
+  // An EOA, because the API recovers the address from the signature; a smart account
+  // signs with EIP-1271, which cannot be recovered.
+  it('creates an EOA for a new sign-in, not a smart account', async () => {
+    const { circle, calls } = fakeCircle()
+    const session = await createWalletService(LIVE, circle).signInSession(SIGN_IN)
+
+    assert.equal(session.challengeId, 'challenge-1')
+    assert.equal(session.circleUserId, SIGN_IN_USER)
+    assert.ok(calls.includes(`createUserPinWithWallets ${ARC_TESTNET} EOA`))
+  })
+
+  it("asks Circle to sign the sign-in message with the user's own wallet", async () => {
+    const { circle, calls } = fakeCircle({ [SIGN_IN_USER]: '0xc1c1' })
+    const signed = await createWalletService(LIVE, circle).signInSignature(
+      SIGN_IN,
+      signInMessage('0xC1c1'),
+    )
+
+    assert.equal(signed.challengeId, 'sign-challenge-1')
+    assert.equal(signed.signature, null)
+    assert.ok(calls.includes(`signMessage 0xc1c1 ${ARC_TESTNET} false`))
+  })
+
+  it('reads the wallet back without asking Circle for anything new', async () => {
+    const { circle, calls } = fakeCircle({ [SIGN_IN_USER]: '0xc1c1' })
+    const wallet = await createWalletService(LIVE, circle).signInWallet(SIGN_IN)
+    const none = fakeCircle()
+    const notYet = await createWalletService(LIVE, none.circle).signInWallet(SIGN_IN)
+
+    assert.equal(wallet.address, '0xc1c1')
+    assert.equal(notYet.address, null)
+    for (const made of [...calls, ...none.calls]) {
+      assert.ok(!/^(createUser |createUserPinWithWallets|signMessage)/.test(made), made)
+    }
+  })
+
+  it('reads a sign-in message written with CRLF line ends as the API does', async () => {
+    const { circle } = fakeCircle({ [SIGN_IN_USER]: '0xc1c1' })
+    const crlf = signInMessage('0xC1c1').replace(/\n/g, '\r\n')
+    const signed = await createWalletService(LIVE, circle).signInSignature(SIGN_IN, crlf)
+    assert.equal(signed.challengeId, 'sign-challenge-1')
+  })
+
+  it('puts no other message in front of the wallet, and none before it exists', async () => {
+    const { circle, calls } = fakeCircle({ [SIGN_IN_USER]: '0xc1c1' })
+    const service = createWalletService(LIVE, circle)
+    await assert.rejects(service.signInSignature(SIGN_IN, signInMessage('0xd00d')), /another wallet/)
+    await assert.rejects(service.signInSignature(SIGN_IN, 'send all my USDC'), /another wallet/)
+    const none = fakeCircle()
+    await assert.rejects(
+      createWalletService(LIVE, none.circle).signInSignature(SIGN_IN, signInMessage('0xc1c1')),
+      /not created yet/,
+    )
+    assert.ok(!calls.some((c) => c.startsWith('signMessage')))
+  })
+
 })
 
 describe('wallet routes', () => {
   async function serve(router: express.Router) {
     const app = express()
+    app.use(express.json()) // as index.ts parses every body
     app.use('/wallets', router)
     const server = app.listen(0)
     await new Promise((resolve) => server.once('listening', resolve))
@@ -200,22 +254,55 @@ describe('wallet routes', () => {
         method: 'POST',
         headers: { 'X-Misthos-Core-Token': 'secret' },
       })
-      const body = (await core.json()) as { simulated: boolean; challengeId: string }
+      const body = (await core.json()) as { challengeId: string }
       await app.close()
 
       assert.equal(session.status, 401, value)
       assert.equal(wallet.status, 401, value)
       assert.equal(wrong.status, 401, value)
       assert.equal(core.status, 200, value)
-      assert.equal(body.simulated, false, value)
       assert.equal(body.challengeId, 'challenge-1', value)
     }
   })
 
-  it('rejects a party it does not know', async () => {
-    const app = await serve(walletRouter(createWalletService(walletConfig({}))))
-    const res = await fetch(`${app.base}/admin/1`)
+  it('serves a sign-in to the core, and says what is wrong with a message it will not sign', async () => {
+    const { circle } = fakeCircle({ [SIGN_IN_USER]: '0xc1c1' })
+    const app = await serve(walletRouter(createWalletService(LIVE, circle), 'secret'))
+    const post = (path: string, body?: unknown, token = 'secret') =>
+      fetch(`${app.base}${path}`, {
+        method: 'POST',
+        headers: { 'X-Misthos-Core-Token': token, 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+    const stranger = await post(`/sign-in/${SIGN_IN}/session`, undefined, 'guess')
+    const session = await post(`/sign-in/${SIGN_IN}/session`)
+    const read = await fetch(`${app.base}/sign-in/${SIGN_IN}`, {
+      headers: { 'X-Misthos-Core-Token': 'secret' },
+    })
+    const signed = await post(`/sign-in/${SIGN_IN}/sign`, { message: signInMessage('0xc1c1') })
+    const refused = await post(`/sign-in/${SIGN_IN}/sign`, { message: 42 })
+    const badId = await post('/sign-in/short/session')
+    const sessionBody = (await session.json()) as { address: string }
+    const signedBody = (await signed.json()) as { challengeId: string }
     await app.close()
-    assert.equal(res.status, 400)
+
+    assert.equal(stranger.status, 401)
+    assert.equal(session.status, 200)
+    assert.equal(read.status, 200)
+    assert.equal(sessionBody.address, '0xc1c1')
+    assert.equal(signed.status, 200)
+    assert.equal(signedBody.challengeId, 'sign-challenge-1')
+    assert.equal(refused.status, 400)
+    assert.equal(badId.status, 400)
+  })
+
+  it('rejects a party it does not know', async () => {
+    const { circle } = fakeCircle()
+    const app = await serve(walletRouter(createWalletService(LIVE, circle), 'secret'))
+    const res = await fetch(`${app.base}/admin/1`, {
+      headers: { 'X-Misthos-Core-Token': 'secret' },
+    })
+    await app.close()
+    assert.ok([400, 404].includes(res.status), String(res.status))
   })
 })

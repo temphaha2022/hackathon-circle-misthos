@@ -11,6 +11,9 @@ The retention periods below are the defaults we hold ourselves to. They are not 
 - No public page or API response carries a contributor's wallet. The contributor list serves a profile with no wallet and no identity-provider reference.
 - The release transfer that pays a contributor names their wallet on chain, so its reference stays off the issue page, the timeline, the decision log and the publisher's audit export. It appears only on the contributor's own annual statement.
 - The decision log names contributors by handle, never by wallet.
+- The paid API (docs/PAID-API.md) carries no wallet next to a person: a reputation is
+  aggregates with no handle, opportunities never say who holds an issue, and a
+  settlement receipt carries the release transfer only in the contributor's own copy.
 
 `test_no_public_response_links_a_wallet_to_a_handle` reads every public response and fails the build if a contributor wallet or a payout reference appears in one.
 
@@ -19,10 +22,6 @@ The retention periods below are the defaults we hold ourselves to. They are not 
 An account links a wallet to a GitHub login in our database, because that link is how we know who may act. It never leaves the database: `/auth/me` shows an account only to its own session, and no other response carries it.
 
 Outside the simulation, a publisher's remaining budget and spending policy are served only to that publisher, signed in. They are commercially sensitive.
-
-The same goes for a publisher's connected books (#43). We read two figures, what remains of one budget and the cash across the asset accounts, when a price is proposed and when the publisher asks. We keep neither. A price's public justification says when it was capped by the budget, and which source capped it, but never the amount. The decision log does not name the amount either.
-
-A publisher's plan and its payments (#53) are its own too. We keep the transaction hash, the amount and the period of each subscription payment, so the publisher can see what it paid for. The payment is read from the chain, where it is public anyway, and we serve it only to the publisher.
 
 ## What we hold, and where
 
@@ -36,6 +35,7 @@ A publisher's plan and its payments (#53) are its own too. We keep the transacti
 | Sanctions screening results | Our database, append-only | Evidence that every payout was screened |
 | Payout records | Our database, as append-only money events, and the chain | Statements, reconciliation, the audit trail |
 | Decision log | Our database, append-only | The record that makes delegated authority defensible |
+| Paid calls: the route, a digest of the request, the paying wallet, the amount and Gateway's settlement reference | Our database, append-only (`paid_calls`), and the edge's log | To reconcile x402 income with Circle Gateway (#201). The payer is an agent's wallet; nothing links it to a handle or an account, and no response but the edge-only books carries it |
 
 Identity is verified at a contributor's first payout, never at signup. Claiming and submitting work need no identity step, so the cost lands only on people who actually get paid.
 
@@ -48,6 +48,8 @@ Identity is verified at a contributor's first payout, never at signup. Claiming 
 | Identity documents | The provider's own retention period, under its contract with us | The provider |
 | Payout records and annual statements | 7 years from the end of the tax year of the payout | Not automated yet |
 | Decision log | The life of the platform | Append-only by design; it holds handles, never wallets |
+| Paid calls | 7 years, as income records | Not automated yet |
+| Price quotes and paid reviews (inputs, answers, latency, cost; never a diff) | 2 years, for calibration | Not automated yet |
 
 ## Statements
 

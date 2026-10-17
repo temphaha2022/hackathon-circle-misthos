@@ -36,6 +36,17 @@ class Installation:
 
 
 @dataclass(frozen=True)
+class OpenIssue:
+    """One open issue, as the picker shows it (#199)."""
+
+    repo: str
+    number: int
+    title: str
+    labels: tuple[str, ...] = ()
+    url: str = ""
+
+
+@dataclass(frozen=True)
 class PullRequest:
     repo: str
     number: int
@@ -47,6 +58,8 @@ class PullRequest:
     additions: int
     deletions: int
     draft: bool = False
+    private: bool = False
+    """The repository is private. Read by the App's installation token all the same."""
 
 
 class ReviewEvent(StrEnum):
@@ -70,8 +83,7 @@ class GitHubGateway(Protocol):
     def list_installations(self) -> list[Installation]:
         """Every installation of the App, with the repositories each one covers.
 
-        Empty when the gateway cannot know: the simulation holds only what a test or a
-        demo put in it.
+        Empty when the gateway cannot know.
         """
 
     def installation_for(self, repo: str) -> Installation | None:
@@ -82,7 +94,14 @@ class GitHubGateway(Protocol):
 
     def read_issue(self, repo: str, number: int) -> IssueFacts | None:
         """The issue and what its repository says about the work, or None when this
-        gateway has nothing to read (the simulation without a fixture)."""
+        gateway has nothing to read."""
+
+    def open_issues(self, repo: str, limit: int = 100) -> list[OpenIssue]:
+        """The repository's open issues, without its pull requests, newest first.
+
+        GitHub's issues endpoint returns both, so the picker is built from the same
+        place a publisher would look. A cap keeps one request bounded.
+        """
 
     def read_pull_request(self, repo: str, number: int) -> PullRequest: ...
 
@@ -99,7 +118,7 @@ class GitHubGateway(Protocol):
 
     creates_issues: bool
     """Whether publishing may open an issue. Only a gateway acting as the App can;
-    the simulation keeps its own GitHub and opens none there."""
+    a fake used by a test opens none there."""
 
     def create_issue(self, repo: str, title: str, body: str, labels: list[str]) -> int:
         """Open an issue and return the number GitHub gave it.
@@ -107,6 +126,13 @@ class GitHubGateway(Protocol):
         A publisher who is describing work GitHub does not hold yet gets an issue
         rather than a made-up number, so what is priced, reviewed and paid is an issue
         that exists and can be linked to.
+        """
+
+    def add_labels(self, repo: str, number: int, labels: list[str]) -> None:
+        """Give an issue these labels, creating one that does not exist yet.
+
+        Linking an existing issue is what puts the platform label on it, so the
+        label-driven flow prices the same issue the web app listed (#199).
         """
 
     def comment(self, repo: str, number: int, body: str) -> None: ...

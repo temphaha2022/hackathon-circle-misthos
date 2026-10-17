@@ -5,7 +5,8 @@
 #
 # Then the web app is on http://localhost:5173, the API reference on
 # http://localhost:5173/docs, and the edge on http://localhost:8080. Everything is
-# still simulated: no chain is contacted unless you configure one (docs/DEPLOY.md).
+# live: it refuses to start without an escrow deployment and the keys it signs with
+# (docs/DEPLOY.md).
 name: misthos
 
 x-backend: &backend
@@ -27,12 +28,15 @@ x-backend: &backend
     MISTHOS_SESSION_SECRET: ${MISTHOS_SESSION_SECRET:-}
     MISTHOS_GITHUB_OAUTH_CLIENT_ID: ${MISTHOS_GITHUB_OAUTH_CLIENT_ID:-}
     MISTHOS_GITHUB_OAUTH_CLIENT_SECRET: ${MISTHOS_GITHUB_OAUTH_CLIENT_SECRET:-}
-    MISTHOS_FINANCE_CONNECTIONS: ${MISTHOS_FINANCE_CONNECTIONS:-}
-    MISTHOS_PLATFORM_WALLET: ${MISTHOS_PLATFORM_WALLET:-}
     MISTHOS_GITHUB_APP_SLUG: ${MISTHOS_GITHUB_APP_SLUG:-}
+    # Shared with the edge: the paid API's routes in the core answer only the edge.
+    MISTHOS_EDGE_CORE_TOKEN: ${MISTHOS_EDGE_CORE_TOKEN:-}
+    # Where buyers reach the edge from outside, for the web app's API page.
+    MISTHOS_PAID_PUBLIC_URL: ${MISTHOS_PAID_PUBLIC_URL:-http://localhost:8080}
+    # The paid API's certificate key, by reference (docs/PAID-API.md).
+    MISTHOS_CERTIFICATE_SECRET_REF: ${MISTHOS_CERTIFICATE_SECRET_REF:-}
     # Reset deletes every row of the database above, so it stays refused unless you
     # opt in for a demo you mean to throw away.
-    MISTHOS_ALLOW_DEMO_RESET: ${MISTHOS_ALLOW_DEMO_RESET:-false}
   depends_on:
     postgres:
       condition: service_healthy
@@ -123,17 +127,18 @@ services:
     environment:
       EDGE_PORT: "8080"
       CORE_API_URL: http://api:8000
-      # Simulated by default, like the API, and read the way the API reads it: true or
-      # false, 1/0, yes/no, on/off, t/f or y/n; anything else stops the edge. Live, the
-      # one flag makes both the x402 gate and the Circle wallet routes real, so the edge
-      # refuses to start without a seller address, CIRCLE_API_KEY, CIRCLE_APP_ID and
-      # EDGE_CORE_TOKEN; this file does not pass the last three through yet. See
-      # edge/.env.example for the facilitator, the networks and the mainnet confirmation.
-      MISTHOS_SIMULATED: ${MISTHOS_SIMULATED:-true}
+      # The edge is always live: it refuses to start without these. See
+      # edge/.env.example for the facilitator, the networks and mainnet confirmation.
       MISTHOS_SELLER_ADDRESS: ${MISTHOS_SELLER_ADDRESS:-}
       GATEWAY_FACILITATOR_URL: ${GATEWAY_FACILITATOR_URL:-}
       GATEWAY_NETWORKS: ${GATEWAY_NETWORKS:-}
       EDGE_CONFIRM_MAINNET: ${EDGE_CONFIRM_MAINNET:-}
+      # The paid API (docs/PAID-API.md): the token the core trusts, price overrides,
+      # and API keys that call free.
+      EDGE_CORE_TOKEN: ${MISTHOS_EDGE_CORE_TOKEN:-}
+      EDGE_PRICES: ${EDGE_PRICES:-}
+      EDGE_FREE_API_KEYS: ${EDGE_FREE_API_KEYS:-}
+      EDGE_PAID_SCREENING: ${EDGE_PAID_SCREENING:-}
     ports:
       - "8080:8080"
     depends_on:

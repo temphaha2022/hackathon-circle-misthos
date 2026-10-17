@@ -17,7 +17,6 @@ from misthos.services.github import (
     STATUS_CONTEXT,
     GitHubError,
     ReviewEvent,
-    SimulatedGitHub,
     StatusState,
     build_github,
 )
@@ -232,6 +231,38 @@ class TestReadPath:
         tree = github.last("GET", f"/repos/{REPO}/git/trees/trunk")
         assert tree.url.params["recursive"] == "1"
 
+    def test_open_issues_are_listed_without_pull_requests(
+        self, app: GitHubApp, github: FakeGitHub
+    ) -> None:
+        github.on(
+            "GET",
+            f"/repos/{REPO}/issues",
+            [
+                {
+                    "number": 7,
+                    "title": "Locales",
+                    "labels": [{"name": "bug"}],
+                    "html_url": f"https://github.com/{REPO}/issues/7",
+                },
+                {
+                    "number": 8,
+                    "title": "A pull request",
+                    "labels": [],
+                    "html_url": f"https://github.com/{REPO}/pull/8",
+                    "pull_request": {},
+                },
+            ],
+        )
+
+        found = app.open_issues(REPO)
+
+        assert [(i.number, i.title, i.labels, i.url) for i in found] == [
+            (7, "Locales", ("bug",), f"https://github.com/{REPO}/issues/7")
+        ]
+        asked = github.last("GET", f"/repos/{REPO}/issues")
+        assert asked.url.params["state"] == "open"
+        assert asked.url.params["per_page"] == "100"
+
     def test_a_pull_request_is_not_an_issue(self, app: GitHubApp, github: FakeGitHub) -> None:
         github.on("GET", f"/repos/{REPO}/issues/88", {"title": "x", "pull_request": {}})
         with pytest.raises(GitHubError, match="is a pull request"):
@@ -305,9 +336,29 @@ class TestWritePath:
         with pytest.raises(GitHubError, match="Issues are disabled"):
             app.create_issue(REPO, "Pin the parser", "", [])
 
-    def test_the_simulation_opens_nothing(self) -> None:
-        with pytest.raises(GitHubError):
-            SimulatedGitHub().create_issue(REPO, "Pin the parser", "", [])
+    def test_a_label_is_created_when_missing_and_then_added_to_the_issue(
+        self, app: GitHubApp, github: FakeGitHub
+    ) -> None:
+        github.on("POST", f"/repos/{REPO}/labels", {"message": "Validation Failed"}, status=422)
+        github.on("POST", f"/repos/{REPO}/issues/87/labels", [{"name": "misthos"}])
+
+        app.add_labels(REPO, 87, ["misthos"])
+
+        created = json.loads(github.last("POST", f"/repos/{REPO}/labels").content)
+        added = json.loads(github.last("POST", f"/repos/{REPO}/issues/87/labels").content)
+        assert created["name"] == "misthos"
+        assert added == {"labels": ["misthos"]}
+
+    def test_a_label_that_cannot_be_created_is_a_github_error(
+        self, app: GitHubApp, github: FakeGitHub
+    ) -> None:
+        github.on(
+            "POST", f"/repos/{REPO}/labels", {"message": "Resource not accessible"}, status=403
+        )
+
+        with pytest.raises(GitHubError, match="Resource not accessible"):
+            app.add_labels(REPO, 87, ["misthos"])
+        assert not any(r.url.path.endswith("/issues/87/labels") for r in github.requests)
 
     def test_a_review_is_pinned_to_the_reviewed_commit(
         self, app: GitHubApp, github: FakeGitHub
@@ -328,7 +379,27 @@ class TestWritePath:
         assert len(sent["description"]) == 140
 
 
-def test_the_app_is_used_only_when_configured(pem: str) -> None:
-    assert isinstance(build_github("", "", "https://api.github.com"), SimulatedGitHub)
+def test_the_app_is_required(pem: str) -> None:
+    from misthos.services.github import GitHubNotConfigured
+
+    with pytest.raises(GitHubNotConfigured):
+        build_github("", "", "https://api.github.com")
     escaped = pem.replace("\n", "\\n")
     assert isinstance(build_github("1", escaped, "https://api.github.com"), GitHubApp)
+
+
+def test_a_pull_request_says_whether_its_repository_is_private() -> None:
+    """The paid review reads public pull requests only (#204), so the reader has to say."""
+    from misthos.services.github.app import pull_request_from
+
+    pr = {
+        "number": 3,
+        "user": {"login": "someone"},
+        "head": {"sha": "a" * 40},
+        "base": {"repo": {"private": True}},
+    }
+    assert pull_request_from("acme/secret", pr).private is True
+    public = {**pr, "base": {"repo": {"private": False}}}
+    unnamed = {k: v for k, v in pr.items() if k != "base"}
+    assert pull_request_from("acme/open", public).private is False
+    assert pull_request_from("acme/open", unnamed).private is False

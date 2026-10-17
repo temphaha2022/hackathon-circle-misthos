@@ -1,32 +1,46 @@
-"""Sign-in with a wallet (#70) and linking a GitHub account (#80)."""
+"""Sign-in with a wallet (#70), a Circle wallet as a second way in, and linking a
+GitHub account (#80) -- the three steps of the sign-in gate (#181).
+
+The gate asks for a wallet, then a GitHub login, then a side. The side is what creates
+the account, so a login linked before it is held against the wallet until then, and
+the account adopts it. Verification is the same for both wallets: a Circle wallet
+signs the message `/auth/nonce` describes, and `/auth/verify` recovers its address
+exactly as it recovers MetaMask's.
+"""
 
 from __future__ import annotations
 
 import secrets
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import RedirectResponse
 
 from misthos.api.guards import limit_signin
-from misthos.api.session import SIGNED_IN, signed_in_address
+from misthos.api.session import signed_in_address
 from misthos.auth import sessions, siwe
 from misthos.config import settings
 from misthos.repositories import AccountConflict
 from misthos.schemas import (
     Account,
+    CircleSignature,
+    CircleSignIn,
+    CircleSignInSession,
+    CircleSignInWallet,
+    CircleSignRequest,
     GitHubLinkStart,
     MeOut,
     NonceOut,
     RoleRequest,
     SessionOut,
     SignInRequest,
-    SimulatedLink,
 )
+from misthos.services.coordination import Busy
 from misthos.services.github import GitHubError
 from misthos.services.github.oauth import GitHubOAuth
+from misthos.services.wallets import Wallets, WalletUnavailable
 from misthos.store import AccountExists, store
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -134,13 +148,31 @@ async def me(request: Request) -> MeOut:
     address = await signed_in_address(request)
     if address is None:
         raise HTTPException(status_code=401, detail="not signed in")
+    return await _me(address)
+
+
+async def _me(address: str) -> MeOut:
     account = await run_in_threadpool(store.repo.get_account, address)
-    return MeOut(address=address, account=account)
+    pending = (
+        None
+        if account is not None
+        else await run_in_threadpool(store.pending_github_login, address)
+    )
+    return MeOut(address=address, account=account, pending_github_login=pending)
 
 
-@router.post("/role", response_model=Account, status_code=201)
+@router.post(
+    "/role",
+    response_model=Account,
+    status_code=201,
+    responses={409: {"description": "This wallet already has a side; a side is chosen once"}},
+)
 async def choose_role(payload: RoleRequest, request: Request) -> Account:
-    """The first sign-in's one choice: publisher or contributor."""
+    """The gate's last step: publisher or contributor, chosen once.
+
+    This creates the account. A GitHub login linked in the step before is adopted onto
+    it, so the account answers with `github_login` set.
+    """
     address = await signed_in_address(request)
     if address is None:
         raise HTTPException(status_code=401, detail="sign in first")
@@ -150,8 +182,10 @@ async def choose_role(payload: RoleRequest, request: Request) -> Account:
                 address, payload.role, payload.name, budget_usdc=payload.budget_usdc
             )
         )
-    except AccountExists as exc:
+    except (AccountExists, AccountConflict) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Busy as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers={"Retry-After": "1"}) from exc
 
 
 LINK_SLOT = "gh-link"
@@ -174,16 +208,20 @@ async def mint_link_state(address: str) -> str:
     "/github/start",
     response_model=GitHubLinkStart,
     responses={
+        401: {"description": "No wallet is signed in"},
         409: {"description": "The browser is on another address than GitHub returns to"},
         503: {"description": "No GitHub OAuth App is configured; the detail says what to set"},
     },
 )
-async def start_github_link(
-    request: Request, account: Account | None = SIGNED_IN
-) -> GitHubLinkStart:
-    """Where to send the user to approve linking their GitHub account."""
-    if account is None:
-        raise HTTPException(status_code=401, detail="sign in and choose a role first")
+async def start_github_link(request: Request) -> GitHubLinkStart:
+    """Where to send the user to approve linking their GitHub account.
+
+    A signed-in wallet is enough: the gate links GitHub before the side is chosen
+    (#181), and the login is held for the wallet until choosing the side adopts it.
+    """
+    address = await signed_in_address(request)
+    if address is None:
+        raise HTTPException(status_code=401, detail="sign in with a wallet first")
     client = oauth()
     if client is None:
         raise not_configured()
@@ -199,13 +237,13 @@ async def start_github_link(
             detail=f"GitHub sends you back to {public}, and this browser is on {origin}; "
             f"open the app at {public} and link from there",
         )
-    state = await mint_link_state(account.address)
+    state = await mint_link_state(address)
     return GitHubLinkStart(authorize_url=client.authorize_url(state, callback_url()))
 
 
 @router.get("/github/callback", include_in_schema=False)
 async def github_callback(
-    request: Request, code: str, state: str
+    request: Request, state: str, code: str | None = None, error: str | None = None
 ) -> RedirectResponse:
     """Finish a link the *same* signed-in wallet started.
 
@@ -216,6 +254,10 @@ async def github_callback(
     publishing, claiming and submitting, so the attacker would then be paid for work
     the victim opened. The account is therefore taken from the session and must match
     the address the state was issued to.    """
+    if code is None or error is not None:
+        # The account holder said no on GitHub, which sends `error` and no code. Back
+        # to the gate, which offers the step again; nothing was linked or held.
+        return RedirectResponse(back_to_the_gate(github="cancelled"), 303)
     address = await signed_in_address(request)
     if address is None:
         raise HTTPException(status_code=401, detail="sign in to finish linking GitHub")
@@ -234,24 +276,143 @@ async def github_callback(
         raise not_configured()
     try:
         login = await run_in_threadpool(client.login_for, code, callback_url())
-        await run_in_threadpool(store.link_github, address, login)
     except GitHubError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except AccountConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return RedirectResponse(f"{settings.public_url.rstrip('/')}/account?linked=github", 303)
-
-
-@router.post("/github/simulate", response_model=Account)
-async def simulate_github_link(
-    payload: SimulatedLink, account: Account | None = SIGNED_IN
-) -> Account:
-    """Link a GitHub login without OAuth, for the simulation's demo only."""
-    if not settings.simulated:
-        raise HTTPException(status_code=403, detail="link through GitHub")
-    if account is None:
-        raise HTTPException(status_code=401, detail="sign in and choose a role first")
     try:
-        return await run_in_threadpool(store.link_github, account.address, payload.login)
-    except AccountConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await run_in_threadpool(store.hold_github_login, address, login)
+    except AccountConflict:
+        # Back to the gate, which says the login is another wallet's. Nothing was held.
+        return RedirectResponse(back_to_the_gate(github="taken"), 303)
+    except Busy:
+        # Someone was linking the same login that instant; the gate asks to try again.
+        return RedirectResponse(back_to_the_gate(github="busy"), 303)
+    return RedirectResponse(back_to_the_gate(), 303)
+
+
+def back_to_the_gate(**reason: str) -> str:
+    """Where GitHub's return lands: the landing page, with the gate open where it was."""
+    query = urlencode({"signin": "continue", **reason})
+    return f"{settings.public_url.rstrip('/')}/?{query}"
+
+
+# ---------------------------------------------------------------- Circle, the second door
+
+
+def circle_sign_in_configured() -> bool:
+    """Whether a Circle wallet can be the way in here: the edge that holds Circle's SDK
+    must be configured."""
+    return bool(settings.edge_core_token)
+
+
+def _circle_or_refuse() -> Wallets:
+    if not circle_sign_in_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="signing in with a Circle wallet is not set up on this server: run the "
+            "edge service with CIRCLE_API_KEY and CIRCLE_APP_ID, set MISTHOS_EDGE_URL and "
+            "MISTHOS_EDGE_CORE_TOKEN, and restart the API",
+        )
+    return Wallets(settings)
+
+
+CIRCLE_RESPONSES: dict[int | str, dict[str, str]] = {
+    502: {"description": "The edge or Circle could not answer"},
+    503: {"description": "No edge is configured for Circle wallets; the detail says what to set"},
+}
+
+
+@router.post(
+    "/circle/session",
+    response_model=CircleSignInSession,
+    dependencies=[limit_signin],
+    responses=CIRCLE_RESPONSES,
+)
+async def circle_session(payload: CircleSignIn) -> CircleSignInSession:
+    """Start or continue signing in with a Circle wallet, before any account exists.
+
+    Not keyed by a party, because there is none yet: the browser's own sign-in id names
+    the Circle user. While the wallet does not exist the answer carries the challenge
+    that sets its PIN and creates it in Circle's frame; once it does, its address, which
+    is the address the sign-in message names. Nothing is written here.
+    """
+    wallets = _circle_or_refuse()
+    try:
+        session = await wallets.sign_in_session(payload.sign_in_id)
+    except WalletUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CircleSignInSession(
+        app_id=session.app_id,
+        user_token=session.user_token,
+        encryption_key=session.encryption_key,
+        challenge_id=session.challenge_id,
+        address=session.address,
+    )
+
+
+@router.post(
+    "/circle/wallet",
+    response_model=CircleSignInWallet,
+    dependencies=[limit_signin],
+    responses=CIRCLE_RESPONSES,
+)
+async def circle_wallet(payload: CircleSignIn) -> CircleSignInWallet:
+    """The Circle wallet's address, once it exists; null while Circle is creating it.
+
+    Only reads. The browser asks this after Circle's frame closes, rather than starting
+    the session again, which would ask Circle for another PIN and wallet challenge.
+    """
+    wallets = _circle_or_refuse()
+    try:
+        found = await wallets.sign_in_wallet(payload.sign_in_id)
+    except WalletUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CircleSignInWallet(address=found.address)
+
+
+@router.post(
+    "/circle/sign",
+    response_model=CircleSignature,
+    dependencies=[limit_signin],
+    responses={
+        **CIRCLE_RESPONSES,
+        400: {"description": "Not a sign-in message for this site, this wallet and a live nonce"},
+        409: {"description": "The Circle wallet does not exist yet"},
+    },
+)
+async def circle_sign(payload: CircleSignRequest) -> CircleSignature:
+    """Have a Circle wallet sign the sign-in message: a `SIGN_MESSAGE` challenge.
+
+    Only a sign-in message is signed: one for this site, with a nonce `/auth/nonce`
+    issued and nobody has spent, naming this Circle wallet's own address. The nonce is
+    not spent here; `/auth/verify` spends it and checks the signature exactly as it
+    checks MetaMask's, so this route opens no way around it.
+    """
+    wallets = _circle_or_refuse()
+    try:
+        claimed = siwe.parse(payload.message)
+    except siwe.SignInRefused as exc:
+        raise HTTPException(status_code=400, detail=f"not a sign-in message: {exc}") from exc
+    if claimed.domain != domain():
+        raise HTTPException(status_code=400, detail=f"the message is for {claimed.domain}")
+    if await run_in_threadpool(store.coordinator.get, f"siwe:{claimed.nonce}") is None:
+        raise HTTPException(status_code=400, detail="the nonce is unknown, used or expired")
+    try:
+        session = await wallets.sign_in_wallet(payload.sign_in_id)
+        if session.address is None:
+            raise HTTPException(
+                status_code=409, detail="the Circle wallet has not been created yet"
+            )
+        if claimed.address.lower() != session.address.lower():
+            raise HTTPException(
+                status_code=400, detail="the message names another wallet than this Circle wallet"
+            )
+        signed = await wallets.sign_in_signature(payload.sign_in_id, payload.message)
+    except WalletUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return CircleSignature(
+        app_id=signed.app_id,
+        user_token=signed.user_token,
+        encryption_key=signed.encryption_key,
+        challenge_id=signed.challenge_id,
+        signature=signed.signature,
+    )

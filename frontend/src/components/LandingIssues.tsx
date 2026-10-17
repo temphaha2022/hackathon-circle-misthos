@@ -1,14 +1,15 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
 import { api, money, relativeTime, type IssueSummaryOut } from '../lib/client'
+import { GateLink } from './SignInGate'
 
 /**
  * The landing page's "Current issues": the open backlog as the API holds it.
  *
  * The prototype drew this table from a mock list. It now reads `/api/v1/issues` once
  * and filters in the browser, so the count, the filters and the total always agree.
- * Each row opens the issue's own page in the app.
+ * Each row opens the issue's own page in the app, once the sign-in gate is done; until
+ * then it opens the gate (#181).
  */
 
 /** The words the landing uses for each state, and the colour it gives it. */
@@ -105,12 +106,12 @@ export default function LandingIssues() {
                 return (
                   <tr key={issue.id}>
                     <td className="issue-title-cell">
-                      <Link to={`/issues/${issue.id}`}>
+                      <GateLink to={`/issues/${issue.id}`}>
                         <strong>{issue.title}</strong>
                         <span>
                           {issue.repo}#{issue.number}
                         </span>
-                      </Link>
+                      </GateLink>
                     </td>
                     <td>{issue.publisher_name}</td>
                     <td>
@@ -166,8 +167,8 @@ export default function LandingIssues() {
             )}
           </table>
         </div>
-        <p className="issues-demo-note">
-          <Link to="/issues">See every issue, with its price and its record →</Link>
+        <p className="issues-note">
+          <GateLink to="/issues">See every issue, with its price and its record →</GateLink>
         </p>
       </div>
     </section>

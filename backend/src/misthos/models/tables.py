@@ -56,7 +56,6 @@ publishers = Table(
     Column("id", Id, primary_key=True),
     Column("name", String(200), nullable=False),
     Column("kind", String(16), nullable=False),
-    Column("tier", String(16), nullable=False),
     Column("wallet_address", String(64), nullable=False),
     Column("chain", String(32), nullable=False),
     Column("budget_remaining_base_units", BigInteger, nullable=False),
@@ -207,7 +206,7 @@ reviews = Table(
 )
 
 # Append-only. `position` keeps each issue's log in the order it was written, which
-# is not always timestamp order: seeded history is backdated around a live entry.
+# is not always timestamp order: imported history is backdated around a live entry.
 decisions = Table(
     "decisions",
     metadata,
@@ -231,7 +230,7 @@ screenings = Table(
     Column("party_kind", String(16), nullable=False),
     Column("party_id", Id, nullable=False),
     Column("wallet_address", String(64), nullable=False),
-    Column("outcome", String(8), nullable=False),
+    Column("outcome", String(16), nullable=False),
     Column("list_name", String(64)),
     Column("provider", String(32), nullable=False),
     Column("reason", String(16), nullable=False),
@@ -255,29 +254,69 @@ money_events = Table(
     UniqueConstraint("issue_id", "position"),
 )
 
-# The simulated chain's own books. Not the ledger: the thing the ledger is reconciled
-# against while no real chain is contacted. Unused once the Arc client runs (#69).
-simulated_escrow = Table(
-    "simulated_escrow",
+# Every x402 call an agent paid for and the edge settled (#201), one row per settlement,
+# appended and never edited. Reconciled against Circle Gateway, which is the authority
+# on what was paid; see domain/paid.py. The payer is an agent's wallet and nothing here
+# names a person.
+paid_calls = Table(
+    "paid_calls",
     metadata,
-    Column("issue_id", Id, primary_key=True),
-    Column("publisher_wallet", String(64), nullable=False),
+    Column("id", Id, primary_key=True),
+    Column("route", String(64), nullable=False),
+    Column("request_digest", String(64), nullable=False),
+    Column("payer", String(64), nullable=False),
     Column("amount_base_units", BigInteger, nullable=False),
-    Column("status", String(16), nullable=False),
-    Column("last_tx_hash", String(80), nullable=False),
-    # The take rate the simulated escrow holds, so the fee a settlement records is the
-    # rate the escrow enforced (#32).
-    Column("fee_bps", Integer, nullable=False, server_default="0"),
+    Column("network", String(32), nullable=False),
+    Column("asset", String(64), nullable=False),
+    Column("transaction", String(128), nullable=False),
+    Column("ref", String(64)),
+    Column("settled_at", Timestamp, nullable=False),
+    UniqueConstraint("route", "request_digest", "transaction"),
+    Index("ix_paid_calls_settled", "settled_at"),
 )
 
-# The simulated escrow's per-issue ceilings: the price a human approved, which the
-# escrow refuses to exceed (#34). Separate from the books because a ceiling exists
-# before any commitment does.
-simulated_escrow_ceilings = Table(
-    "simulated_escrow_ceilings",
+# Every price the paid API quoted, with what it was asked (#203): for audit and for
+# calibrating the engine. Joined to its payment by the edge's request digest.
+price_quotes = Table(
+    "price_quotes",
     metadata,
-    Column("issue_id", Id, primary_key=True),
-    Column("ceiling_base_units", BigInteger, nullable=False),
+    Column("id", Id, primary_key=True),
+    Column("route", String(64), nullable=False),
+    Column("request_digest", String(64), index=True),
+    Column("payer", String(64)),
+    Column("free_caller", String(64)),
+    Column("inputs", Json, nullable=False),
+    Column("output", Json, nullable=False),
+    Column("quoted_at", Timestamp, nullable=False),
+)
+
+# Every paid pre-flight review (#204): the job while it runs, and afterwards the record
+# of how long it took, what it cost and what it decided, for calibration. Keeps the
+# diff's size, never the diff.
+paid_reviews = Table(
+    "paid_reviews",
+    metadata,
+    Column("id", Id, primary_key=True),
+    Column("status", String(16), nullable=False),
+    Column("request_digest", String(64), index=True),
+    Column("payer", String(64)),
+    Column("free_caller", String(64)),
+    Column("repo", String(200)),
+    Column("title", String(300), nullable=False),
+    Column("criteria", Integer, nullable=False),
+    Column("files", Integer, nullable=False),
+    Column("additions", Integer, nullable=False),
+    Column("deletions", Integer, nullable=False),
+    Column("created_at", Timestamp, nullable=False),
+    Column("started_at", Timestamp),
+    Column("finished_at", Timestamp),
+    Column("verdict", String(16)),
+    Column("rule", String(64)),
+    Column("reviewer", String(100)),
+    Column("seconds", Float),
+    Column("cost_base_units", BigInteger),
+    Column("result", Json, nullable=False),
+    Column("error", Text),
 )
 
 # A signed-in wallet and the role it chose (#70). One role per wallet.
@@ -289,6 +328,19 @@ accounts = Table(
     Column("party_id", Id, nullable=False, unique=True),
     Column("github_login", String(64), unique=True),
     Column("created_at", Timestamp, nullable=False),
+)
+
+# A GitHub login linked by a wallet that has not chosen its side yet (#181). The sign-in
+# gate links GitHub before the account exists, so the login waits here until the side
+# is chosen and the account adopts it. `login_key` is the login lowercased: a login held
+# here is already one wallet's, whatever its case, as one on `accounts` is.
+pending_github_links = Table(
+    "pending_github_links",
+    metadata,
+    Column("address", String(42), primary_key=True),
+    Column("github_login", String(64), nullable=False),
+    Column("login_key", String(64), nullable=False, unique=True),
+    Column("held_at", Timestamp, nullable=False),
 )
 
 # Every GitHub webhook delivery handled, so a redelivery is recognised and ignored.
@@ -306,36 +358,6 @@ counters = Table(
     metadata,
     Column("name", String(32), primary_key=True),
     Column("value", BigInteger, nullable=False),
-)
-
-
-# A publisher's plan, one row per publisher (#53). The pending payment request, if
-# any, is kept with it.
-subscriptions = Table(
-    "subscriptions",
-    metadata,
-    Column("publisher_id", Id, ForeignKey("publishers.id"), primary_key=True),
-    Column("plan", String(16), nullable=False),
-    Column("status", String(16), nullable=False),
-    Column("period_start", Timestamp),
-    Column("period_end", Timestamp),
-    Column("cancel_at_period_end", Boolean, nullable=False),
-    Column("pending", Json),
-    Column("updated_at", Timestamp, nullable=False),
-)
-
-# Every subscription payment, append-only. A transaction pays for one period, once.
-subscription_payments = Table(
-    "subscription_payments",
-    metadata,
-    Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("publisher_id", Id, ForeignKey("publishers.id"), nullable=False),
-    Column("plan", String(16), nullable=False),
-    Column("amount_base_units", BigInteger, nullable=False),
-    Column("tx_hash", String(66), nullable=False, unique=True),
-    Column("period_start", Timestamp, nullable=False),
-    Column("period_end", Timestamp, nullable=False),
-    Column("paid_at", Timestamp, nullable=False),
 )
 
 

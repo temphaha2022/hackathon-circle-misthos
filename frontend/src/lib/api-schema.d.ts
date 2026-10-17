@@ -89,7 +89,10 @@ export interface paths {
         put?: never;
         /**
          * Choose Role
-         * @description The first sign-in's one choice: publisher or contributor.
+         * @description The gate's last step: publisher or contributor, chosen once.
+         *
+         *     This creates the account. A GitHub login linked in the step before is adopted onto
+         *     it, so the account answers with `github_login` set.
          */
         post: operations["choose_role_api_v1_auth_role_post"];
         delete?: never;
@@ -110,6 +113,9 @@ export interface paths {
         /**
          * Start Github Link
          * @description Where to send the user to approve linking their GitHub account.
+         *
+         *     A signed-in wallet is enough: the gate links GitHub before the side is chosen
+         *     (#181), and the login is held for the wallet until choosing the side adopts it.
          */
         post: operations["start_github_link_api_v1_auth_github_start_post"];
         delete?: never;
@@ -118,7 +124,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/auth/github/simulate": {
+    "/api/v1/auth/circle/session": {
         parameters: {
             query?: never;
             header?: never;
@@ -128,10 +134,63 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Simulate Github Link
-         * @description Link a GitHub login without OAuth, for the simulation's demo only.
+         * Circle Session
+         * @description Start or continue signing in with a Circle wallet, before any account exists.
+         *
+         *     Not keyed by a party, because there is none yet: the browser's own sign-in id names
+         *     the Circle user. While the wallet does not exist the answer carries the challenge
+         *     that sets its PIN and creates it in Circle's frame; once it does, its address, which
+         *     is the address the sign-in message names. Nothing is written here.
          */
-        post: operations["simulate_github_link_api_v1_auth_github_simulate_post"];
+        post: operations["circle_session_api_v1_auth_circle_session_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/circle/wallet": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Circle Wallet
+         * @description The Circle wallet's address, once it exists; null while Circle is creating it.
+         *
+         *     Only reads. The browser asks this after Circle's frame closes, rather than starting
+         *     the session again, which would ask Circle for another PIN and wallet challenge.
+         */
+        post: operations["circle_wallet_api_v1_auth_circle_wallet_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/circle/sign": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Circle Sign
+         * @description Have a Circle wallet sign the sign-in message: a `SIGN_MESSAGE` challenge.
+         *
+         *     Only a sign-in message is signed: one for this site, with a nonce `/auth/nonce`
+         *     issued and nobody has spent, naming this Circle wallet's own address. The nonce is
+         *     not spent here; `/auth/verify` spends it and checks the signature exactly as it
+         *     checks MetaMask's, so this route opens no way around it.
+         */
+        post: operations["circle_sign_api_v1_auth_circle_sign_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -218,9 +277,20 @@ export interface paths {
          * Commitment Plan
          * @description The two transactions the publisher's own wallet sends to fund the issue.
          *
-         *     The platform never signs a commitment: it moves the publisher's USDC. Approving
-         *     the price records it as the escrow's ceiling; the publisher's wallet then lets the
-         *     escrow take that amount and commits it, and approving again books it.
+         *     The platform never signs a commitment: it moves the publisher's USDC. Approving the
+         *     price records it as the escrow's ceiling; the publisher's wallet then lets the escrow
+         *     take that amount and commits it, and approving again books it.
+         *
+         *     The amount is the publisher's price -- the same value `_fund` records as the ceiling,
+         *     and never the engine's suggestion. The escrow refuses any commitment above the
+         *     ceiling (`ExceedsCeiling`), so a plan built from the suggestion could not be booked:
+         *     the wallet would be asked for a number the contract had already ruled out (#150).
+         *
+         *     The deadline is the one the approval fixed, to the second, and the amount and rate
+         *     are the approved ones too. Working them out here instead is what made the booking
+         *     refuse a commitment once an hour had passed between the plan and the booking: the
+         *     escrow's term starts at the commit, so `now + 14d` no longer matches what is on
+         *     chain, and it never matches again (#126).
          */
         get: operations["commitment_plan_api_v1_issues__issue_id__commitment_get"];
         put?: never;
@@ -245,47 +315,6 @@ export interface paths {
         get: operations["get_escrow_api_v1_issues__issue_id__escrow_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/issues/{issue_id}/advance": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Advance
-         * @description Move the issue one step along the demo path. The simulation's only: it
-         *     fabricates the pull request, so a deployment uses the explicit actions.
-         */
-        post: operations["advance_api_v1_issues__issue_id__advance_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/issues/{issue_id}/complete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Complete
-         * @description Run the rest of the happy path: verdict, merge, release. The simulation's only.
-         */
-        post: operations["complete_api_v1_issues__issue_id__complete_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -330,7 +359,7 @@ export interface paths {
          *     The approver is whoever is signed in, by the GitHub login linked to their account,
          *     and the organisation must have named that login. A name in the request would let
          *     anyone who knew an approver's name release the money, so it counts only in the
-         *     simulation, for a visitor who is not signed in, as the claim's does.
+         *     the signed-in account, which must carry a linked GitHub login.
          */
         post: operations["approve_release_api_v1_issues__issue_id__approve_release_post"];
         delete?: never;
@@ -471,27 +500,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/loop": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Loop
-         * @description The loop in public: issues funded, settled and paid, for one repository or all.
-         *     Built for a repository's watchers to see, so it carries no wallet or transfer.
-         */
-        get: operations["loop_api_v1_loop_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/issues/{issue_id}/dispute": {
         parameters: {
             query?: never;
@@ -522,8 +530,8 @@ export interface paths {
         };
         /**
          * List Publishers
-         * @description Every publisher. Outside the simulation a publisher's budget and spending
-         *     policy are served only to that publisher, signed in.
+         * @description Every publisher. A publisher's budget and spending policy are served only to
+         *     that publisher, signed in.
          */
         get: operations["list_publishers_api_v1_publishers_get"];
         put?: never;
@@ -565,70 +573,6 @@ export interface paths {
         get: operations["decisions_api_v1_decisions_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/demo/issues/{issue_id}/pull-request": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Demo Pull Request
-         * @description Open the claimant's pull request on the simulated GitHub, so the browser can
-         *     submit it. The simulation's only; submitting stays the claimant's own action.
-         */
-        post: operations["demo_pull_request_api_v1_demo_issues__issue_id__pull_request_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/demo/issues/{issue_id}/merge": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Demo Merge
-         * @description Merge the submitted pull request on the simulated GitHub, as the publisher
-         *     would on the real one; it is handled exactly as that merge's webhook. The
-         *     simulation's only.
-         */
-        post: operations["demo_merge_api_v1_demo_issues__issue_id__merge_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/demo/reset": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reset
-         * @description Put the simulation back to its seed. With a database configured this deletes
-         *     every row in it, so it is refused there unless MISTHOS_ALLOW_DEMO_RESET is set.
-         */
-        post: operations["reset_api_v1_demo_reset_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -688,9 +632,8 @@ export interface paths {
          * @description One contributor's payouts for one calendar year, to file from.
          *
          *     A statement is personal: its settlement references would link a wallet to a
-         *     handle. It is served to the signed-in contributor it belongs to, and by the
-         *     simulation, whose numbers are not real; an operator exports one with
-         *     `python -m misthos.services.statements`.
+         *     handle. It is served to the signed-in contributor it belongs to; an operator
+         *     exports one with `python -m misthos.services.statements`.
          */
         get: operations["statement_api_v1_contributors__contributor_id__statements__year__get"];
         put?: never;
@@ -722,27 +665,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/publishers/{publisher_id}/spend": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Spend
-         * @description What was budgeted, committed, released and refunded in a year, by category,
-         *     and the settled fixes to file for a security review.
-         */
-        get: operations["spend_api_v1_publishers__publisher_id__spend_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/publishers/{publisher_id}/audit": {
         parameters: {
             query?: never;
@@ -756,30 +678,6 @@ export interface paths {
          *     funded, unedited, as JSON or one sortable CSV.
          */
         get: operations["audit_api_v1_publishers__publisher_id__audit_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/publishers/{publisher_id}/finance": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Finance
-         * @description What the publisher's books say, for the publisher alone.
-         *
-         *     Read-only, and informational: it no longer caps or refuses a price (#142), so a
-         *     publisher whose budget is small can still fund whatever they think the work is
-         *     worth. Cash and budgets are commercially sensitive, so only the publisher sees it.
-         */
-        get: operations["finance_api_v1_publishers__publisher_id__finance_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -809,7 +707,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plans": {
+    "/api/v1/publishers/{publisher_id}/github/issues": {
         parameters: {
             query?: never;
             header?: never;
@@ -817,79 +715,16 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List Plans
-         * @description What each plan costs and includes, with the take rate and the smallest fix
-         *     it will price.
+         * Connected Issues
+         * @description The open issues in one of the publisher's connected repositories (#199).
+         *
+         *     The picker offers these instead of asking for a number. An issue already open on
+         *     Misthos is returned with the listing it has, so the form can point at it rather
+         *     than let a second publish be refused after the fact.
          */
-        get: operations["list_plans_api_v1_plans_get"];
+        get: operations["connected_issues_api_v1_publishers__publisher_id__github_issues_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/publishers/{publisher_id}/subscription": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Subscription
-         * @description The plan in force, its period, what is waiting to be paid, and every payment.
-         */
-        get: operations["subscription_api_v1_publishers__publisher_id__subscription_get"];
-        put?: never;
-        /**
-         * Subscribe
-         * @description Choose a plan. A paid plan answers with what to send and where; choosing Open
-         *     cancels at the end of the paid period.
-         */
-        post: operations["subscribe_api_v1_publishers__publisher_id__subscription_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/publishers/{publisher_id}/subscription/payment": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Confirm Payment
-         * @description Confirm the transaction that paid. The server reads it from the chain, and the
-         *     plan switches on only if it moved what is due from the publisher's wallet to ours.
-         */
-        post: operations["confirm_payment_api_v1_publishers__publisher_id__subscription_payment_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/demo/publishers/{publisher_id}/subscription/pay": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Demo Pay
-         * @description Send what is due on the simulation's rail and confirm it. The simulation's only.
-         */
-        post: operations["demo_pay_api_v1_demo_publishers__publisher_id__subscription_pay_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -952,6 +787,23 @@ export interface paths {
          * @description After the challenge completes, read the address back from Circle and keep it.
          */
         post: operations["link_api_v1_wallets__party___party_id__link_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/catalog/paid": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Paid */
+        get: operations["paid_api_v1_catalog_paid_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1023,14 +875,12 @@ export interface components {
              * Format: date-time
              */
             generated_at: string;
-            /** Simulated */
-            simulated: boolean;
         };
-        /** ApproveReleaseRequest */
-        ApproveReleaseRequest: {
-            /** Approver */
-            approver?: string | null;
-        };
+        /**
+         * ApproveReleaseRequest
+         * @description Empty: the approver is the signed-in account's linked GitHub login.
+         */
+        ApproveReleaseRequest: Record<string, never>;
         /**
          * AuditExport
          * @description Everything an auditor needs about one organisation's issues, from the decision
@@ -1046,8 +896,6 @@ export interface components {
              * Format: date-time
              */
             generated_at: string;
-            /** Simulated */
-            simulated: boolean;
             /** Issues */
             issues: components["schemas"]["AuditIssue"][];
         };
@@ -1101,6 +949,68 @@ export interface components {
             /** Tx Hash */
             tx_hash: string | null;
         };
+        /**
+         * CircleSignIn
+         * @description Which Circle sign-in this browser is continuing (#181).
+         *
+         *     The id is the browser's own, random, and names the Circle user behind its wallet. It
+         *     is not a credential: Circle signs nothing for it without the PIN its owner set in
+         *     Circle's own frame.
+         */
+        CircleSignIn: {
+            /** Sign In Id */
+            sign_in_id: string;
+        };
+        /**
+         * CircleSignInSession
+         * @description What Circle's frame needs to continue a sign-in with a Circle wallet.
+         */
+        CircleSignInSession: {
+            /** App Id */
+            app_id: string;
+            /** User Token */
+            user_token: string;
+            /** Encryption Key */
+            encryption_key: string;
+            /** Challenge Id */
+            challenge_id: string | null;
+            /** Address */
+            address: string | null;
+        };
+        /**
+         * CircleSignInWallet
+         * @description A Circle sign-in wallet as it stands: its address once Circle has created it.
+         */
+        CircleSignInWallet: {
+            /** Address */
+            address: string | null;
+        };
+        /** CircleSignRequest */
+        CircleSignRequest: {
+            /** Sign In Id */
+            sign_in_id: string;
+            /** Message */
+            message: string;
+        };
+        /**
+         * CircleSignature
+         * @description The answer to signing a sign-in message with a Circle wallet.
+         *
+         *     Circle signs once its owner approves with their PIN, so this carries the challenge
+         *     for the frame to run and the signature comes back from the frame.
+         */
+        CircleSignature: {
+            /** App Id */
+            app_id: string;
+            /** User Token */
+            user_token: string;
+            /** Encryption Key */
+            encryption_key: string;
+            /** Challenge Id */
+            challenge_id: string | null;
+            /** Signature */
+            signature: string | null;
+        };
         /** Claim */
         Claim: {
             /** Contributor Id */
@@ -1121,11 +1031,11 @@ export interface components {
              */
             active: boolean;
         };
-        /** ClaimRequest */
-        ClaimRequest: {
-            /** Contributor Id */
-            contributor_id?: string | null;
-        };
+        /**
+         * ClaimRequest
+         * @description Empty: a signed-in contributor claims as themselves.
+         */
+        ClaimRequest: Record<string, never>;
         /**
          * CommitmentPlan
          * @description How a publisher funds an issue from their own wallet, in the order to send.
@@ -1223,18 +1133,6 @@ export interface components {
             /** Reason */
             reason: string;
         };
-        /**
-         * DemoPullRequestOut
-         * @description A pull request the simulated GitHub opened for the claimant (simulation only).
-         */
-        DemoPullRequestOut: {
-            /** Pr Number */
-            pr_number: number;
-            /** Author */
-            author: string;
-            /** Head Sha */
-            head_sha: string;
-        };
         /** DisputeRequest */
         DisputeRequest: {
             /** Reason */
@@ -1293,10 +1191,10 @@ export interface components {
             chain_id: number;
             /**
              * Source
-             * @description chain: read from MisthosEscrow; simulation: the simulated escrow's books
-             * @enum {string}
+             * @description read from MisthosEscrow
+             * @constant
              */
-            source: "chain" | "simulation";
+            source: "chain";
             /**
              * Status
              * @enum {string}
@@ -1321,64 +1219,6 @@ export interface components {
             explorer_url: string;
         };
         /**
-         * FileableItem
-         * @description One settled fix, with what a security review needs to file it.
-         */
-        FileableItem: {
-            /** Issue Id */
-            issue_id: string;
-            /** Repo */
-            repo: string;
-            /** Number */
-            number: number;
-            /** Title */
-            title: string;
-            /** Labels */
-            labels: string[];
-            /** Compliance Driven */
-            compliance_driven: boolean;
-            /** Acceptance Criteria */
-            acceptance_criteria: string[];
-            /** Amount */
-            amount: {
-                [key: string]: string | number;
-            };
-            /**
-             * Settled At
-             * Format: date-time
-             */
-            settled_at: string;
-            /** Github Url */
-            github_url: string;
-        };
-        /**
-         * FinanceOut
-         * @description A publisher's money as the pricing engine sees it, for that publisher alone (#43).
-         */
-        FinanceOut: {
-            /** Publisher Id */
-            publisher_id: string;
-            /** Declared Budget Usdc */
-            declared_budget_usdc: string;
-            /** Connected */
-            connected: boolean;
-            /** Source */
-            source?: string | null;
-            /** Budget Remaining Usdc */
-            budget_remaining_usdc?: string | null;
-            /** Cash Usdc */
-            cash_usdc?: string | null;
-            /** As Of */
-            as_of?: string | null;
-            /** Spendable Usdc */
-            spendable_usdc: string;
-            /**
-             * Note
-             * @default
-             */
-            note: string;
-        };
-        /**
          * FundRequest
          * @description Approving the price the publisher already set.
          *
@@ -1387,6 +1227,27 @@ export interface components {
          *     with `PATCH /issues/{issue_id}/price` until someone claims the issue (#142).
          */
         FundRequest: Record<string, never>;
+        /**
+         * GitHubIssueOut
+         * @description One open issue in a connected repository, for the publisher's picker (#199).
+         */
+        GitHubIssueOut: {
+            /** Number */
+            number: number;
+            /** Title */
+            title: string;
+            /** Labels */
+            labels: string[];
+            /** Html Url */
+            html_url: string;
+            /** Listed Issue Id */
+            listed_issue_id?: string | null;
+        };
+        /** GitHubIssuesOut */
+        GitHubIssuesOut: {
+            /** Issues */
+            issues: components["schemas"]["GitHubIssueOut"][];
+        };
         /** GitHubLinkStart */
         GitHubLinkStart: {
             /** Authorize Url */
@@ -1414,19 +1275,15 @@ export interface components {
             network_label: string;
             /**
              * Money
-             * @description simulated: nothing moves; test: Arc testnet faucet USDC; real: Arc mainnet; unknown: not an Arc network, so treat its USDC as real
+             * @description test: Arc testnet faucet USDC; real: Arc mainnet; unknown: not an Arc network, so treat its USDC as real
              * @enum {string}
              */
-            money: "simulated" | "test" | "real" | "unknown";
+            money: "test" | "real" | "unknown";
             /** Money Note */
             money_note: string;
-            /** Seeded Issues */
-            seeded_issues: number;
-            /** Simulated */
-            simulated: boolean;
             /**
              * Github Oauth
-             * @description Whether a real GitHub account can be linked here: both MISTHOS_GITHUB_OAUTH_CLIENT_ID and MISTHOS_GITHUB_OAUTH_CLIENT_SECRET are set. Without it, the simulation links a typed login and a deployment links none.
+             * @description Whether a real GitHub account can be linked here: both MISTHOS_GITHUB_OAUTH_CLIENT_ID and MISTHOS_GITHUB_OAUTH_CLIENT_SECRET are set.
              */
             github_oauth: boolean;
             /**
@@ -1434,6 +1291,12 @@ export interface components {
              * @description The callback URL to register on the GitHub OAuth App, from MISTHOS_PUBLIC_URL
              */
             github_oauth_callback_url: string;
+            /**
+             * Circle Sign In
+             * @description Whether a Circle wallet can be the way in (#181): the edge service is configured, which MISTHOS_EDGE_CORE_TOKEN being set stands for.
+             * @default false
+             */
+            circle_sign_in: boolean;
         };
         /** IssueOut */
         IssueOut: {
@@ -1517,53 +1380,21 @@ export interface components {
             github_url: string;
         };
         /**
-         * LoopOut
-         * @description The loop in public: what was funded, settled and paid, for one repository or
-         *     all of them. No wallet and no transfer appears here.
+         * MeOut
+         * @description Who is signed in, and how far through the sign-in gate they are (#181).
+         *
+         *     The gate's three steps read off this: signed in at all, a GitHub login (linked on
+         *     the account, or held while there is none), and an account, which is the side.
          */
-        LoopOut: {
-            /** Repo */
-            repo: string | null;
-            /** Funded Open */
-            funded_open: number;
-            /** Settled Issues */
-            settled_issues: number;
-            /** Settled Issues 7D */
-            settled_issues_7d: number;
-            /** Matched Volume Usdc */
-            matched_volume_usdc: string;
-            /** Recent */
-            recent: components["schemas"]["LoopSettlement"][];
-        };
-        /** LoopSettlement */
-        LoopSettlement: {
-            /** Issue Id */
-            issue_id: string;
-            /** Repo */
-            repo: string;
-            /** Number */
-            number: number;
-            /** Title */
-            title: string;
-            /** Amount */
-            amount: {
-                [key: string]: string | number;
-            };
-            /** Contributor */
-            contributor: string;
-            /**
-             * Settled At
-             * Format: date-time
-             */
-            settled_at: string;
-            /** Github Url */
-            github_url: string;
-        };
-        /** MeOut */
         MeOut: {
             /** Address */
             address: string;
             account: components["schemas"]["Account"] | null;
+            /**
+             * Pending Github Login
+             * @description A GitHub login linked before the side was chosen. The account adopts it when it is created, and from then on it is the account's github_login and this is null.
+             */
+            pending_github_login?: string | null;
         };
         /**
          * MetricsOut
@@ -1638,64 +1469,76 @@ export interface components {
             /** Statement */
             statement: string;
         };
-        /** PaymentConfirmation */
-        PaymentConfirmation: {
-            /** Tx Hash */
-            tx_hash: string;
+        /**
+         * PaidCatalogOut
+         * @description What the edge sells over x402, read from the edge itself so its prices are the
+         *     ones charged. `available` is false when the edge could not be read.
+         */
+        PaidCatalogOut: {
+            /** Available */
+            available: boolean;
+            /**
+             * Base Url
+             * @description Where buyers call the paid routes; MISTHOS_PAID_PUBLIC_URL
+             */
+            base_url: string | null;
+            /** Networks */
+            networks?: string[];
+            /** Pay To */
+            pay_to?: string | null;
+            /** Asset */
+            asset?: string | null;
+            /** Certificate Signer */
+            certificate_signer?: string | null;
+            /** Routes */
+            routes?: components["schemas"]["PaidRouteOut"][];
         };
         /**
-         * PaymentRequest
-         * @description What to send to start or renew a plan: USDC on Arc, from the publisher's wallet.
+         * PaidRouteOut
+         * @description One x402 route the edge sells, as its catalog lists it.
          */
-        PaymentRequest: {
+        PaidRouteOut: {
+            /** Id */
+            id: string;
             /**
-             * Plan
+             * Method
              * @enum {string}
              */
-            plan: "open" | "team" | "enterprise";
-            /** Amount Usdc */
-            amount_usdc: string;
-            /** Pay To */
-            pay_to: string;
-            /** Payer */
-            payer: string;
-            /** Chain */
-            chain: string;
-            /** Chain Id */
-            chain_id: number;
-            /** Usdc Address */
-            usdc_address: string;
-            /**
-             * Expires At
-             * Format: date-time
-             */
-            expires_at: string;
-        };
-        /** PlanOut */
-        PlanOut: {
-            /**
-             * Id
-             * @enum {string}
-             */
-            id: "open" | "team" | "enterprise";
+            method: "GET" | "POST";
+            /** Path */
+            path: string;
+            /** Price */
+            price: {
+                [key: string]: string;
+            };
             /** Name */
             name: string;
-            /** Audience */
-            audience: string;
-            /** Monthly Usdc */
-            monthly_usdc: string;
-            /** Price From */
-            price_from: boolean;
-            /** Self Serve */
-            self_serve: boolean;
-            /** Take Rate Percent */
-            take_rate_percent: number;
-            /** Minimum Fix Usdc */
-            minimum_fix_usdc: string;
-            /** Features */
-            features: string[];
-            /** Support */
-            support: string;
+            /** Summary */
+            summary: string;
+            /**
+             * Group
+             * @enum {string}
+             */
+            group: "Core" | "Marketplace" | "Analytics" | "Trust";
+            /** Returns */
+            returns?: string | null;
+            /**
+             * Free Tier
+             * @default false
+             */
+            free_tier: boolean;
+            /**
+             * Async
+             * @default false
+             */
+            async: boolean;
+            /**
+             * Capped
+             * @default false
+             */
+            capped: boolean;
+            /** Note */
+            note?: string | null;
         };
         /** PolicyRequest */
         PolicyRequest: {
@@ -1799,11 +1642,6 @@ export interface components {
              * @enum {string}
              */
             kind: "company" | "maintainer";
-            /**
-             * Tier
-             * @enum {string}
-             */
-            tier: "open" | "team" | "enterprise";
             wallet: components["schemas"]["Wallet"];
             /** Budget Remaining Usdc */
             budget_remaining_usdc: string;
@@ -1819,7 +1657,7 @@ export interface components {
         /**
          * PublisherListing
          * @description A publisher as anyone may see it. Its budget and spending policy are
-         *     commercially sensitive, so outside the simulation they are filled in only for
+         *     commercially sensitive, so they are filled in only for
          *     the signed-in publisher itself ([PRIVACY.md](../../docs/PRIVACY.md)).
          */
         PublisherListing: {
@@ -1832,11 +1670,6 @@ export interface components {
              * @enum {string}
              */
             kind: "company" | "maintainer";
-            /**
-             * Tier
-             * @enum {string}
-             */
-            tier: "open" | "team" | "enterprise";
             wallet: components["schemas"]["Wallet"];
             /** Budget Remaining Usdc */
             budget_remaining_usdc?: string | null;
@@ -1964,70 +1797,6 @@ export interface components {
             /** Signature */
             signature: string;
         };
-        /** SimulatedLink */
-        SimulatedLink: {
-            /** Login */
-            login: string;
-        };
-        /** SpendCategory */
-        SpendCategory: {
-            /** Label */
-            label: string;
-            /** Committed */
-            committed: {
-                [key: string]: string | number;
-            };
-            /** Released */
-            released: {
-                [key: string]: string | number;
-            };
-            /** Committed This Month */
-            committed_this_month: {
-                [key: string]: string | number;
-            };
-            /** Limit */
-            limit?: {
-                [key: string]: string | number;
-            } | null;
-        };
-        /**
-         * SpendOut
-         * @description What an organisation budgeted, committed, released and can file (#50).
-         */
-        SpendOut: {
-            /** Publisher Id */
-            publisher_id: string;
-            /** Name */
-            name: string;
-            /** Year */
-            year: number;
-            /** Month */
-            month: string;
-            /** Budget Remaining */
-            budget_remaining: {
-                [key: string]: string | number;
-            };
-            /** Committed Held */
-            committed_held: {
-                [key: string]: string | number;
-            };
-            /** Committed */
-            committed: {
-                [key: string]: string | number;
-            };
-            /** Released */
-            released: {
-                [key: string]: string | number;
-            };
-            /** Refunded */
-            refunded: {
-                [key: string]: string | number;
-            };
-            /** By Category */
-            by_category: components["schemas"]["SpendCategory"][];
-            /** Fileable */
-            fileable: components["schemas"]["FileableItem"][];
-        };
         /** StatementLine */
         StatementLine: {
             /**
@@ -2081,72 +1850,6 @@ export interface components {
         SubmitRequest: {
             /** Pr Number */
             pr_number: number;
-        };
-        /** SubscribeRequest */
-        SubscribeRequest: {
-            /**
-             * Plan
-             * @enum {string}
-             */
-            plan: "open" | "team" | "enterprise";
-        };
-        /** SubscriptionOut */
-        SubscriptionOut: {
-            /** Publisher Id */
-            publisher_id: string;
-            /**
-             * Plan
-             * @enum {string}
-             */
-            plan: "open" | "team" | "enterprise";
-            /**
-             * Status
-             * @enum {string}
-             */
-            status: "none" | "pending" | "active" | "past_due" | "lapsed" | "cancelled" | "contract";
-            /** Period End */
-            period_end?: string | null;
-            /** Grace Ends */
-            grace_ends?: string | null;
-            /**
-             * Cancel At Period End
-             * @default false
-             */
-            cancel_at_period_end: boolean;
-            pending?: components["schemas"]["PaymentRequest"] | null;
-            /** Payments */
-            payments?: components["schemas"]["SubscriptionPayment"][];
-            /** Features */
-            features?: string[];
-        };
-        /** SubscriptionPayment */
-        SubscriptionPayment: {
-            /** Publisher Id */
-            publisher_id: string;
-            /**
-             * Plan
-             * @enum {string}
-             */
-            plan: "open" | "team" | "enterprise";
-            /** Amount Usdc */
-            amount_usdc: string;
-            /** Tx Hash */
-            tx_hash: string;
-            /**
-             * Period Start
-             * Format: date-time
-             */
-            period_start: string;
-            /**
-             * Period End
-             * Format: date-time
-             */
-            period_end: string;
-            /**
-             * Paid At
-             * Format: date-time
-             */
-            paid_at: string;
         };
         /** TimelineEntry */
         TimelineEntry: {
@@ -2235,8 +1938,6 @@ export interface components {
              */
             challenge_id: string | null;
             wallet: components["schemas"]["Wallet"] | null;
-            /** Simulated */
-            simulated: boolean;
         };
     };
     responses: never;
@@ -2360,6 +2061,13 @@ export interface operations {
                     "application/json": components["schemas"]["Account"];
                 };
             };
+            /** @description This wallet already has a side; a side is chosen once */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -2389,6 +2097,13 @@ export interface operations {
                     "application/json": components["schemas"]["GitHubLinkStart"];
                 };
             };
+            /** @description No wallet is signed in */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description The browser is on another address than GitHub returns to */
             409: {
                 headers: {
@@ -2405,7 +2120,7 @@ export interface operations {
             };
         };
     };
-    simulate_github_link_api_v1_auth_github_simulate_post: {
+    circle_session_api_v1_auth_circle_session_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -2414,7 +2129,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SimulatedLink"];
+                "application/json": components["schemas"]["CircleSignIn"];
             };
         };
         responses: {
@@ -2424,7 +2139,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Account"];
+                    "application/json": components["schemas"]["CircleSignInSession"];
                 };
             };
             /** @description Validation Error */
@@ -2435,6 +2150,128 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+            /** @description The edge or Circle could not answer */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No edge is configured for Circle wallets; the detail says what to set */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    circle_wallet_api_v1_auth_circle_wallet_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CircleSignIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CircleSignInWallet"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The edge or Circle could not answer */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No edge is configured for Circle wallets; the detail says what to set */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    circle_sign_api_v1_auth_circle_sign_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CircleSignRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CircleSignature"];
+                };
+            };
+            /** @description Not a sign-in message for this site, this wallet and a live nonce */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The Circle wallet does not exist yet */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description The edge or Circle could not answer */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No edge is configured for Circle wallets; the detail says what to set */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -2649,88 +2486,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EscrowReadback"];
                 };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    advance_api_v1_issues__issue_id__advance_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Any unique string, such as a UUID. Retries with the same key get the first response back for 24 hours instead of running again. */
-                "idempotency-key"?: string | null;
-            };
-            path: {
-                issue_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["IssueOut"];
-                };
-            };
-            /** @description Illegal step, busy issue or refused by the escrow */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    complete_api_v1_issues__issue_id__complete_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Any unique string, such as a UUID. Retries with the same key get the first response back for 24 hours instead of running again. */
-                "idempotency-key"?: string | null;
-            };
-            path: {
-                issue_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["IssueOut"];
-                };
-            };
-            /** @description Illegal step, busy issue or refused by the escrow */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -3068,38 +2823,6 @@ export interface operations {
             };
         };
     };
-    loop_api_v1_loop_get: {
-        parameters: {
-            query?: {
-                /** @description owner/name; every repository if empty */
-                repo?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["LoopOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     dispute_api_v1_issues__issue_id__dispute_post: {
         parameters: {
             query?: never;
@@ -3213,128 +2936,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
-            };
-        };
-    };
-    demo_pull_request_api_v1_demo_issues__issue_id__pull_request_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                issue_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DemoPullRequestOut"];
-                };
-            };
-            /** @description Outside the simulation, or not the claimant */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Nothing claimed and waiting for a pull request */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    demo_merge_api_v1_demo_issues__issue_id__merge_post: {
-        parameters: {
-            query?: never;
-            header?: {
-                /** @description Any unique string, such as a UUID. Retries with the same key get the first response back for 24 hours instead of running again. */
-                "idempotency-key"?: string | null;
-            };
-            path: {
-                issue_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["IssueOut"];
-                };
-            };
-            /** @description Outside the simulation, or not the publisher */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description No pull request to merge, or nothing to release */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reset_api_v1_demo_reset_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: number;
-                    };
-                };
-            };
-            /** @description Outside the simulation, or a database is configured and its operator has not allowed reset */
-            403: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
         };
     };
@@ -3459,39 +3060,6 @@ export interface operations {
             };
         };
     };
-    spend_api_v1_publishers__publisher_id__spend_get: {
-        parameters: {
-            query?: {
-                year?: number | null;
-            };
-            header?: never;
-            path: {
-                publisher_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SpendOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     audit_api_v1_publishers__publisher_id__audit_get: {
         parameters: {
             query?: {
@@ -3513,37 +3081,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AuditExport"];
                     "text/csv": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    finance_api_v1_publishers__publisher_id__finance_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                publisher_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["FinanceOut"];
                 };
             };
             /** @description Validation Error */
@@ -3588,29 +3125,12 @@ export interface operations {
             };
         };
     };
-    list_plans_api_v1_plans_get: {
+    connected_issues_api_v1_publishers__publisher_id__github_issues_get: {
         parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PlanOut"][];
-                };
+            query: {
+                /** @description owner/name, as the connection lists it */
+                repo: string;
             };
-        };
-    };
-    subscription_api_v1_publishers__publisher_id__subscription_get: {
-        parameters: {
-            query?: never;
             header?: never;
             path: {
                 publisher_id: string;
@@ -3625,108 +3145,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SubscriptionOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    subscribe_api_v1_publishers__publisher_id__subscription_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                publisher_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SubscribeRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SubscriptionOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    confirm_payment_api_v1_publishers__publisher_id__subscription_payment_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                publisher_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PaymentConfirmation"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SubscriptionOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    demo_pay_api_v1_demo_publishers__publisher_id__subscription_pay_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                publisher_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SubscriptionOut"];
+                    "application/json": components["schemas"]["GitHubIssuesOut"];
                 };
             };
             /** @description Validation Error */
@@ -3857,6 +3276,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    paid_api_v1_catalog_paid_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PaidCatalogOut"];
                 };
             };
         };

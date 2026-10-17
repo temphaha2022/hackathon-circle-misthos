@@ -1,8 +1,7 @@
 # Running and deploying Misthos
 
-Three ways to run it, from least to most real. All three are simulated until you
-configure otherwise: no chain is contacted, and GitHub and the review model are
-simulated until their keys are set.
+Three ways to run it, from least to most real. Every way is live: the API refuses to
+start without an escrow deployment and a GitHub App.
 
 ## 1. Development: two processes, no infrastructure
 
@@ -24,15 +23,13 @@ docker compose up --build
 | `web` | The web app, served by nginx, which proxies `/api`, `/docs` and `/openapi.json` | http://localhost:5173 |
 | `api` | FastAPI, with the sweeper switched off | http://127.0.0.1:8000 (localhost only) |
 | `worker` | `python -m misthos.workers`: timers, reviews, re-screening, reconciliation | metrics at http://127.0.0.1:9100/metrics (localhost only), `worker:9100` inside the network |
-| `edge` | The x402 gate and the Circle CLI bridge | http://localhost:8080 |
+| `edge` | The x402 seller (the paid API, [PAID-API.md](./PAID-API.md)) and the Circle CLI bridge | http://localhost:8080 |
 | `postgres` | State, durable in the `pgdata` volume | inside the network |
 | `redis` | The per-issue lock, idempotency keys and rate limits | inside the network |
 
-The schema migrates itself on first start, and an empty database is seeded with the
-demo issues. `docker compose down --volumes` starts over. The web app's Reset button
-is refused here, because a reset deletes every row in Postgres and needs no sign-in;
-pass `MISTHOS_ALLOW_DEMO_RESET=true` only for a demo you mean to throw away. CI boots
-exactly this and fails the build if any service does not become healthy.
+The schema migrates itself on first start; a fresh database starts empty.
+`docker compose down --volumes` starts over. CI boots exactly this and fails the
+build if any service does not become healthy.
 
 Pass real integrations through from your shell or a `.env` file next to
 `compose.yaml`: `MISTHOS_GITHUB_APP_ID`, `MISTHOS_GITHUB_APP_PRIVATE_KEY`,
@@ -41,6 +38,13 @@ Pass real integrations through from your shell or a `.env` file next to
 `MISTHOS_SESSION_SECRET`, `MISTHOS_GITHUB_OAUTH_CLIENT_ID` and
 `MISTHOS_GITHUB_OAUTH_CLIENT_SECRET`. Every other setting is in
 `backend/.env.example`.
+
+The edge sells x402 calls. It needs `MISTHOS_SELLER_ADDRESS`, the address paid, and
+`MISTHOS_EDGE_CORE_TOKEN`, which compose hands to both the edge and the API: the paid
+routes run in the API behind that token. `EDGE_PRICES` overrides a route's price and
+`EDGE_FREE_API_KEYS` lets a caller through free. `MISTHOS_PAID_PUBLIC_URL` is where
+buyers reach the edge from outside, which the web app's API page (`/public-api`) shows
+beside the x402 routes. See [PAID-API.md](./PAID-API.md).
 
 ### Observing it
 
@@ -107,18 +111,17 @@ explorer runs Blockscout, so verifying needs no API key.
 A broadcast writes `contracts/deployments/5042002.json`: the escrow's address, its
 owner, attestor and USDC, and the block to scan logs from. Commit it; the API reads
 the address from it, so there is nothing to copy by hand. A dry run (without
-`--broadcast`) writes no record, and outside the simulation the API refuses a
-record whose address holds no code. `MISTHOS_ESCROW_CONTRACT` still pins an
+`--broadcast`) writes no record, and the API refuses a record whose address holds
+no code. `MISTHOS_ESCROW_CONTRACT` still pins an
 address explicitly and wins over the record. `MISTHOS_CHAIN_ID` names the network;
 there is no separate label to set.
 
-`GET /api/v1/issues/{id}/escrow` reads a commitment back: from the contract with
-`eth_call` when `MISTHOS_SIMULATED=false`, from the simulated escrow's books
-otherwise, and says which. Report anything settled on testnet as testnet.
+`GET /api/v1/issues/{id}/escrow` reads a commitment back from the contract with
+`eth_call`. Report anything settled on testnet as testnet.
 
 ### Settling on Arc
 
-With `MISTHOS_SIMULATED=false` the store settles through the deployed escrow (#69).
+The store settles through the deployed escrow (#69).
 Who signs what is fixed by the contract, and the platform never signs for a
 publisher:
 
@@ -128,12 +131,17 @@ publisher:
 | The commitment itself | the publisher's own wallet, in the browser | never the platform's |
 | Release on acceptance | the attestor | `MISTHOS_ATTESTOR_SECRET_REF` |
 | Refund once the deadline passed | the attestor (anyone may) | `MISTHOS_ATTESTOR_SECRET_REF` |
+| A paid escrow attestation or receipt ([PAID-API.md](./PAID-API.md)) | the certificate key, off chain, EIP-191 | `MISTHOS_CERTIFICATE_SECRET_REF` |
 
-Both keys are read from the secret store by reference when a transaction is signed.
+The certificate key is a third key and the escrow does not know it: it vouches for what
+the escrow holds and can move nothing. It needs no gas. Its address is published at the
+edge's `GET /paid` as `certificate_signer`.
+
+Every key is read from the secret store by reference when it signs.
 `MISTHOS_SECRET_STORE_DIR` points at a mounted directory with one file per reference,
 mode 600, for local runs and anvil; a production deployment supplies its managed
-store behind the same `SecretStore` interface. Fund both signers with a little USDC,
-which is Arc's gas. The owner is the deployer unless ownership was transferred; the
+store behind the same `SecretStore` interface. Fund the owner and the attestor with a
+little USDC, which is Arc's gas. The owner is the deployer unless ownership was transferred; the
 attestor is the address passed as `MISTHOS_ATTESTOR_ADDRESS` at deploy.
 
 A release the chain refuses — a revert, or the RPC unreachable — does not undo the
@@ -155,9 +163,6 @@ hand over by reading `GET /api/v1/issues/{id}/escrow` -- a ceiling with no money
 against it means the commitment is owed -- and not by reading the refusal's own
 words, which a proxy between the browser and the API may have replaced (#147). A
 wallet that has never been to Arc is offered the chain before the two transactions.
-The demo seed is not written outside the simulation: it would fund made-up issues
-from made-up wallets.
-
 After any change to the contract, run `mise run abi:contracts` and commit
 `contracts/deployments/MisthosEscrow.abi.json`; `mise run lint` fails while it is
 stale.
@@ -175,8 +180,7 @@ Mainnet moves real USDC irreversibly. There is deliberately no mainnet task.
 
 This runs an issue in a real repository from a label to a payout on GitHub events
 (#6). Use a sandbox repository and two GitHub accounts: one publishes, one
-contributes. Leave `MISTHOS_SIMULATED=true` to keep the money simulated while GitHub
-is real, or settle on Arc testnet as section 3 describes.
+contributes. Money settles on Arc testnet as section 3 describes.
 
 1. **Give GitHub a way to reach the API.** On a laptop, a smee.io channel forwards
    webhooks to it. Open https://smee.io/new, then run:
@@ -210,8 +214,7 @@ is real, or settle on Arc testnet as section 3 describes.
    `MISTHOS_GITHUB_OAUTH_CLIENT_SECRET`. These are the App's own **Client ID** and
    **Client secrets** from the same settings page, so no separate OAuth App is
    needed; the callback is `http://localhost:5173/api/v1/auth/github/callback` (and
-   the deployment's own `https://<host>/api/v1/auth/github/callback`). In the
-   simulation, linking by login works too.
+   the deployment's own `https://<host>/api/v1/auth/github/callback`).
 
    An OAuth App is not a substitute for the App itself. It can only identify who
    someone is — the token this flow returns is read once for the login and dropped —
@@ -220,19 +223,20 @@ is real, or settle on Arc testnet as section 3 describes.
    would never arrive.
 
 4. **The publisher:**
-   - Signs in at http://localhost:5173/account, chooses publisher, and links the
-     GitHub account they will install the App with.
+   - Presses **Sign in** at http://localhost:5173, signs in with a wallet, links the
+     GitHub account they will install the App with, and chooses publisher.
    - Installs the App on the sandbox repository. **Your repositories** on the
-     account page lists it.
+     profile at `/account` lists it.
 
 5. **On GitHub:**
    1. Open an issue and add the `misthos` label. The App replies with what comparable
       work settled for, the reasoning and the drafted criteria, and asks the publisher
       to name the price with `/misthos price 250`. Nothing is funded until they do.
-      Or publish it from the web app instead: **Publish** takes `owner/name` or a
-      pasted GitHub link, a price, and leaving the issue number **empty opens a new
-      issue** in that repository with the title and description. A number the publisher
-      gives is listed without creating anything.
+      Or publish it from the web app instead: **Publish** lists the repositories the
+      App is installed on and the open issues in the chosen one. Picking an issue
+      lists it and adds the `misthos` label to it on GitHub. **Create new issue**
+      opens a new issue in that repository with the title, description and labels
+      typed there. Either way the publisher names the price.
    2. The publisher comments `/misthos price 250` to name the amount if the web form did
       not, then `/misthos approve`, or `/misthos criteria` and a list first; all of them
       can go in one comment, each on its own line, and they run in order. The App posts

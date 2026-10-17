@@ -67,7 +67,8 @@ mise run setup     # install every runtime's dependencies
 mise run dev       # API on :8000 and web app on :5173
 ```
 
-Open <http://localhost:5173>. The API reference is at <http://127.0.0.1:8000/docs>.
+Open <http://localhost:5173>. The public API, free and x402 routes with their prices, is
+at <http://localhost:5173/public-api>; the full schema is at <http://127.0.0.1:8000/docs>.
 To link your real GitHub account rather than a typed login, set up an OAuth App first:
 see [Linking your real GitHub account locally](#linking-your-real-github-account-locally).
 
@@ -121,8 +122,7 @@ MISTHOS_REDIS_URL=redis://localhost:6379/0 mise run dev:api
 ### Linking your real GitHub account locally
 
 Publishing and claiming need a linked GitHub login. With nothing configured the
-Account page says linking is not set up here, and the simulation takes a login you
-type instead. To link your real account:
+sign-in gate's GitHub step says linking is not set up here. To link your real account:
 
 1. Create a GitHub OAuth App at <https://github.com/settings/developers> (OAuth Apps,
    New OAuth App).
@@ -141,11 +141,12 @@ type instead. To link your real account:
 
 4. Restart `mise run dev`, open <http://localhost:5173> (not 127.0.0.1: GitHub returns
    to the address in `MISTHOS_PUBLIC_URL`, and your session lives on the one you
-   opened), sign in, choose a side and press **Link with GitHub**.
+   opened), press **Sign in**, sign in with a wallet and press **Link with GitHub**.
+   GitHub sends you back to the gate, which carries on with the side.
 
 ### Connecting a real repository
 
-GitHub is simulated until a GitHub App is configured. Register one from
+GitHub is read and written as a GitHub App. Register one from
 `backend/github-app-manifest.json` (replace the webhook host first), install it on
 the repository, and set its id, private key and webhook secret:
 
@@ -175,11 +176,62 @@ against a real repository.
 
 ### Signing in
 
-Outside the simulation nothing is written anonymously. A wallet signs in with a
-Sign-In with Ethereum message (`POST /api/v1/auth/nonce`, then `/auth/verify`), takes
-a role once, publisher or contributor (`/auth/role`), and links its GitHub account
-(`/auth/github/start`). A publisher acts only on its own issues, and a contributor
-submits only a pull request it opened. The loop then runs through explicit actions:
+There is one way into the app: the sign-in gate (#181). Every way in from the landing
+page — **Sign in**, **Plans**, an issue's row, **See every issue** — and the app's own
+**Sign in** open it while it is unfinished, and it asks for three things in this order:
+
+1. **A wallet.** MetaMask first, or a Circle wallet as the second way in. Either wallet
+   signs the
+   same Sign-In with Ethereum message (`POST /api/v1/auth/nonce`, then `/auth/verify`),
+   and the API recovers the address from the signature the same way for both.
+2. **A GitHub account,** linked before the side is chosen (`/auth/github/start`). Until
+   the account exists the login is held against
+   the wallet, and it is already that wallet's: another wallet linking it, pending or
+   complete, is refused with the conflict named.
+3. **A side,** publisher or contributor, chosen once (`/auth/role`). This creates the
+   account, which adopts the held login. A publisher names its organisation and a
+   budget; a contributor is known by its GitHub login.
+
+The gate then closes and the app opens at its overview. Leaving it early costs nothing:
+each step is kept by the API as soon as it is done, and reopening the gate starts at the
+first step that is not. While it is unfinished the landing page's header says **Finish
+signing in** rather than **Open the app**. The profile at `/account` shows who you are,
+the wallet the money moves through and a publisher's repositories, and sends you to the
+gate for anything missing.
+
+Through the API the three steps are the same for every wallet. `$SIGNED` is the body
+`{"message": …, "signature": …}` for that nonce: the message as `siweMessage` in
+`frontend/src/lib/siwe.ts` builds it, signed by the wallet it names. GitHub linking is
+the OAuth redirect (`/auth/github/start`, then the callback), so it is done in the
+browser.
+
+```bash
+api=http://localhost:5173/api/v1
+nonce=$(curl -s -c jar -X POST $api/auth/nonce | jq -r .nonce)
+curl -s -b jar -c jar -X POST $api/auth/verify \
+  -H 'Content-Type: application/json' -d "$SIGNED"           # step 1: a session
+# step 2: open $api/auth/github/start in the browser and approve on GitHub
+curl -s -b jar -X POST $api/auth/role \
+  -H 'Content-Type: application/json' -d '{"role": "contributor", "name": "octo-dev"}'
+# {"address": "0x…", "role": "contributor", "party_id": "CON-…",
+#  "github_login": "octo-dev", "created_at": "…"}
+```
+
+A Circle wallet is the same step 1 by another door. `POST /auth/circle/session` with a
+random `sign_in_id` the browser keeps returns the Circle user's token and, the first
+time, the challenge that sets a PIN and creates the wallet in Circle's frame; once the
+wallet exists it returns its address, and `POST /auth/circle/wallet` reads that address
+back without asking Circle for anything new. `POST /auth/circle/sign` with the nonce's message
+naming that address returns a `SIGN_MESSAGE` challenge for the frame, and the signature
+the frame hands back goes to `/auth/verify` like MetaMask's. The route signs only a
+sign-in message for this site, with a nonce nobody has spent, naming that very wallet.
+The edge service provides it (`MISTHOS_EDGE_CORE_TOKEN`, with `CIRCLE_API_KEY` and
+`CIRCLE_APP_ID` on the edge), and `/health` says whether it is set up as
+`circle_sign_in`.
+
+Nothing is written anonymously. A publisher acts only on its own
+issues, and a contributor submits only a pull request it opened. The loop then runs
+through explicit actions:
 
 | Who | Action | Endpoint |
 | --- | --- | --- |
@@ -193,27 +245,20 @@ submits only a pull request it opened. The loop then runs through explicit actio
 Linking needs a GitHub OAuth App (`MISTHOS_GITHUB_OAUTH_CLIENT_ID` and
 `MISTHOS_GITHUB_OAUTH_CLIENT_SECRET`, see
 [Linking your real GitHub account locally](#linking-your-real-github-account-locally));
-without one the simulation links a typed login and a deployment links none. Set
-`MISTHOS_SESSION_SECRET` to keep sessions across a restart. The demo stepper
-(`/advance` and `/complete`) runs only in the simulation, because it fabricates the
-pull request and the merge.
+without one linking is not offered. Set `MISTHOS_SESSION_SECRET` to keep sessions
+across a restart.
 
-The web app does all of this from **Account** and each issue's page, which shows
-each party only the step that is theirs. In the simulation there is no need for a
-wallet extension: the demo publisher and contributor wallets are throwaway keys kept
-in the browser, and GitHub is simulated, so the contributor opens their pull request
-and the publisher merges it with a button. Use two browsers, or a private window, to
-be both sides at once.
+The web app does all of this from the sign-in gate and each issue's page, which shows
+each party only the step that is theirs. A wallet extension signs both sides in; the
+contributor opens their pull request and the publisher merges it on GitHub. Use two
+browsers, or a private window, to be both sides at once.
 
-### Pricing from history and from the publisher's books
+### Pricing from history
 
 The engine's suggestion moves toward what similar work settled at on the platform, and its
 confidence is only as high as that history allows. It is advice: the publisher names the
-price, and the only thing that refuses one is the $5 to $100,000 bound. A publisher's own
-books are still read for display rather than to cap a price: the operator connects Firefly
-III, or a beancount ledger with a Fava budget, in `MISTHOS_FINANCE_CONNECTIONS` (see
-`backend/.env.example`), and the publisher sees what is left. To check the weights
-against issues whose worth is known:
+price, and the only thing that refuses one is the $5 to $100,000 bound. To check the
+weights against issues whose worth is known:
 
 ```bash
 mise run pricing:calibrate                       # the corpus of real, scored issues
@@ -227,15 +272,6 @@ that priced those issues), and it fits nothing.
 ```bash
 cd backend && uv run python -m misthos.services.calibration --settled
 ```
-
-### Plans
-
-**Plans** in the web app lists Open, Team and Enterprise as 06 prices them. A
-publisher buys Team there without a conversation by sending 249 USDC on Arc from its
-wallet; the API reads the transfer from the chain before switching the plan on. Set
-`MISTHOS_PLATFORM_WALLET` to the platform's wallet so payments have somewhere to go.
-In the simulation, a button pays on a simulated rail. Enterprise is agreed with us and
-recorded by an operator with `python -m misthos.services.contracts`.
 
 ### The whole system
 
@@ -261,6 +297,16 @@ corpus, by complexity band:
 ```bash
 mise run review:harness
 ```
+
+### The paid API
+
+Agents can buy read-only views of what Misthos knows, one call at a time, over x402:
+the edge answers `402` with the price in Arc testnet USDC, and a call paid through
+Circle Gateway Nanopayments gets its answer. A call that fails is not charged.
+`GET /paid` on the edge lists what is for sale, as a page in a browser.
+[docs/PAID-API.md](docs/PAID-API.md) covers how a call is paid, the free tier, and
+reconciling the books; [docs/BUYING.md](docs/BUYING.md) how to pay; and
+[mcp/](mcp/README.md) is an MCP server that pays for an agent, within a spend cap.
 
 ## License
 

@@ -15,12 +15,11 @@ from datetime import datetime
 
 from misthos.domain.compliance import PartyKind, Screening
 from misthos.domain.issue import IssueState
+from misthos.domain.paid import PaidCall, PaidReview, PriceQuote
 from misthos.models.records import IssueRecord
 from misthos.repositories.base import (
     AccountConflict,
     AppendOnlyViolation,
-    PaymentAlreadyUsed,
-    Seed,
     StaleIssue,
 )
 from misthos.schemas import (
@@ -29,8 +28,6 @@ from misthos.schemas import (
     Decision,
     Publisher,
     RepoConnection,
-    Subscription,
-    SubscriptionPayment,
 )
 
 
@@ -38,65 +35,19 @@ class MemoryRepository:
     def __init__(self) -> None:
         self._guard = threading.RLock()
         self._named_locks: dict[str, threading.Lock] = {}
-        # The highest version any issue reached before the last reset. A reset keeps
-        # it, and an issue saved for the first time starts above it, so a copy loaded
-        # before a reset never matches the issue the seed brings back under its id.
         self._version_floor = 0
         self._issues: dict[str, IssueRecord] = {}
-        self.reset()
-
-    def reset(self, seed: Seed | None = None) -> None:
-        # Everything below happens under the guard every reader takes, so nobody can
-        # look in between the old contents going and the seed arriving.
-        with self._guard:
-            self._version_floor = max(
-                [self._version_floor, *(r.version for r in self._issues.values())]
-            )
-            self._publishers: dict[str, Publisher] = {}
-            self._contributors: dict[str, Contributor] = {}
-            self._issues: dict[str, IssueRecord] = {}
-            self._counters: dict[str, int] = {}
-            self._screenings: list[Screening] = []
-            self._deliveries: dict[str, tuple[str, datetime]] = {}
-            self._accounts: dict[str, Account] = {}
-            self._subscriptions: dict[str, Subscription] = {}
-            self._connections: dict[str, RepoConnection] = {}
-            self._subscription_payments: list[SubscriptionPayment] = []
-            if seed is None:
-                return
-            for publisher in seed.publishers:
-                self._publishers[publisher.id] = publisher.model_copy(deep=True)
-            for contributor in seed.contributors:
-                self._contributors[contributor.id] = contributor.model_copy(deep=True)
-            for rec in seed.issues:
-                stored = copy.deepcopy(rec)
-                stored.version = self._version_floor + 1
-                self._issues[rec.id] = stored
-            self._counters = dict(seed.counters)
-
-    def as_seed(self) -> Seed:
-        """What this repository holds, as a seed another repository can be reset to."""
-        with self._guard:
-            # A seed carries parties, issues and the id sequences, and nothing else,
-            # so anything else written here would be lost on the way.
-            assert not (
-                self._screenings
-                or self._deliveries
-                or self._accounts
-                or self._subscriptions
-                or self._connections
-                or self._subscription_payments
-            ), "a seed holds publishers, contributors, issues and counters only"
-            return Seed(
-                publishers=tuple(p.model_copy(deep=True) for p in self._publishers.values()),
-                contributors=tuple(c.model_copy(deep=True) for c in self._contributors.values()),
-                issues=tuple(copy.deepcopy(r) for r in self._issues.values()),
-                counters=dict(self._counters),
-            )
-
-    def is_empty(self) -> bool:
-        with self._guard:
-            return not self._publishers and not self._issues
+        self._publishers: dict[str, Publisher] = {}
+        self._contributors: dict[str, Contributor] = {}
+        self._counters: dict[str, int] = {}
+        self._screenings: list[Screening] = []
+        self._deliveries: dict[str, tuple[str, datetime]] = {}
+        self._accounts: dict[str, Account] = {}
+        self._pending_logins: dict[str, tuple[str, datetime]] = {}
+        self._connections: dict[str, RepoConnection] = {}
+        self._paid_calls: list[PaidCall] = []
+        self._price_quotes: list[PriceQuote] = []
+        self._paid_reviews: dict[str, PaidReview] = {}
 
     def next_value(self, counter: str, start: int) -> int:
         with self._guard:
@@ -193,47 +144,41 @@ class MemoryRepository:
         with self._guard:
             return [c.model_copy(deep=True) for c in self._connections.values()]
 
-    # ------------------------------------------------------------ plans
-
-    def get_subscription(self, publisher_id: str) -> Subscription | None:
-        with self._guard:
-            found = self._subscriptions.get(publisher_id)
-            return found.model_copy(deep=True) if found else None
-
-    def save_subscription(self, subscription: Subscription) -> None:
-        with self._guard:
-            self._subscriptions[subscription.publisher_id] = subscription.model_copy(deep=True)
-
-    def list_subscriptions(self) -> list[Subscription]:
-        with self._guard:
-            return [s.model_copy(deep=True) for s in self._subscriptions.values()]
-
-    def add_subscription_payment(self, payment: SubscriptionPayment) -> None:
-        with self._guard:
-            if any(
-                p.tx_hash.lower() == payment.tx_hash.lower() for p in self._subscription_payments
-            ):
-                raise PaymentAlreadyUsed(payment.tx_hash)
-            self._subscription_payments.append(payment.model_copy(deep=True))
-
-    def list_subscription_payments(self, publisher_id: str) -> list[SubscriptionPayment]:
-        with self._guard:
-            return [
-                p.model_copy(deep=True)
-                for p in self._subscription_payments
-                if p.publisher_id == publisher_id
-            ]
-
     def save_account(self, account: Account) -> None:
         with self._guard:
-            if account.github_login and any(
-                other.github_login
-                and other.github_login.lower() == account.github_login.lower()
-                and other.address != account.address
-                for other in self._accounts.values()
-            ):
-                raise AccountConflict(f"{account.github_login} is linked to another wallet")
+            if account.github_login:
+                self._refuse_taken(account.address, account.github_login)
             self._accounts[account.address.lower()] = account.model_copy(deep=True)
+
+    def get_pending_github_login(self, address: str) -> str | None:
+        with self._guard:
+            held = self._pending_logins.get(address.lower())
+            return held[0] if held else None
+
+    def hold_github_login(self, address: str, login: str, at: datetime) -> None:
+        with self._guard:
+            self._refuse_taken(address, login)
+            self._pending_logins[address.lower()] = (login, at)
+
+    def drop_pending_github_login(self, address: str) -> None:
+        with self._guard:
+            self._pending_logins.pop(address.lower(), None)
+
+    def _refuse_taken(self, address: str, login: str) -> None:
+        """One login, one wallet: linked or held, and whatever its case. Under the guard."""
+        address, wanted = address.lower(), login.lower()
+        if any(
+            other.github_login
+            and other.github_login.lower() == wanted
+            and other.address.lower() != address
+            for other in self._accounts.values()
+        ):
+            raise AccountConflict(f"{login} is linked to another wallet")
+        if any(
+            held.lower() == wanted and holder != address
+            for holder, (held, _) in self._pending_logins.items()
+        ):
+            raise AccountConflict(f"{login} is being linked by another wallet")
 
     # ---------------------------------------------------------- deliveries
 
@@ -263,10 +208,6 @@ class MemoryRepository:
                 if states is None or r.state in states
             ]
 
-    def count_issues(self) -> int:
-        with self._guard:
-            return len(self._issues)
-
     def save_issues(self, *records: IssueRecord) -> None:
         with self._guard:
             # Check every record before writing any, so the save is all or nothing.
@@ -288,6 +229,78 @@ class MemoryRepository:
             rows = [d for r in self._issues.values() for d in r.decisions]
         rows.sort(key=lambda d: d.created_at, reverse=True)
         return [d.model_copy() for d in rows[:limit]]
+
+    def page_decisions(
+        self,
+        *,
+        after: tuple[datetime, str] | None = None,
+        limit: int = 50,
+        issue_id: str | None = None,
+        actor: str | None = None,
+        action: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[Decision]:
+        with self._guard:
+            rows = [d for r in self._issues.values() for d in r.decisions]
+        kept = [
+            d
+            for d in rows
+            if (after is None or (d.created_at, d.id) > after)
+            and (issue_id is None or d.issue_id == issue_id)
+            and (actor is None or d.actor == actor)
+            and (action is None or d.action == action)
+            and (since is None or d.created_at >= since)
+            and (until is None or d.created_at < until)
+        ]
+        kept.sort(key=lambda d: (d.created_at, d.id))
+        return [d.model_copy() for d in kept[:limit]]
+
+    # ---------------------------------------------------------- paid calls
+
+    def record_paid_call(self, call: PaidCall) -> PaidCall:
+        with self._guard:
+            key = (call.route, call.request_digest, call.transaction)
+            for kept in self._paid_calls:
+                if (kept.route, kept.request_digest, kept.transaction) == key:
+                    return kept
+            self._paid_calls.append(call)
+            return call
+
+    def get_paid_call(self, call_id: str) -> PaidCall | None:
+        with self._guard:
+            return next((c for c in self._paid_calls if c.id == call_id), None)
+
+    def list_paid_calls(
+        self, *, since: datetime | None = None, route: str | None = None, limit: int = 500
+    ) -> list[PaidCall]:
+        with self._guard:
+            rows = [
+                c
+                for c in self._paid_calls
+                if (since is None or c.settled_at >= since) and (route is None or c.route == route)
+            ]
+        rows.sort(key=lambda c: (c.settled_at, c.id), reverse=True)
+        return rows[:limit]
+
+    def record_price_quote(self, quote: PriceQuote) -> None:
+        with self._guard:
+            self._price_quotes.append(copy.deepcopy(quote))
+
+    def list_price_quotes(self, limit: int = 500) -> list[PriceQuote]:
+        with self._guard:
+            rows = [copy.deepcopy(q) for q in self._price_quotes]
+        rows.sort(key=lambda q: (q.quoted_at, q.id), reverse=True)
+        return rows[:limit]
+
+    def save_paid_review(self, review: PaidReview) -> None:
+        with self._guard:
+            self._paid_reviews[review.id] = copy.deepcopy(review)
+
+    def get_paid_review(self, review_id: str) -> PaidReview | None:
+        with self._guard:
+            found = self._paid_reviews.get(review_id)
+            return copy.deepcopy(found) if found else None
 
     @contextmanager
     def try_lock(self, name: str) -> Iterator[bool]:

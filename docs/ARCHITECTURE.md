@@ -13,15 +13,15 @@ The diagrams below describe the target system. This table is what is actually in
 | Layer | Component | State |
 | --- | --- | --- |
 | Web | Vite + React SPA, generated API client | Built. Sign-in, publishing and every lifecycle action, live against the API (#73); a Playwright test drives the whole loop in CI |
-| Edge | Express x402 gate and Circle CLI bridge | Built. The gate settles through Circle Gateway Nanopayments when `MISTHOS_SIMULATED=false`; simulated by default |
-| Core | FastAPI, lifecycle, pricing engine, review agent, decision log, money ledger | Built. Money moves through a chain gateway, simulated until #69. The review agent is Claude once `MISTHOS_ANTHROPIC_API_KEY` is set, and a rule reviewer otherwise |
+| Edge | Express x402 seller and Circle CLI bridge | Built. Paid routes are an allowlist (`edge/src/catalog.ts`), each verified, answered by the core, then settled through Circle Gateway Nanopayments, so a failed call is free ([PAID-API.md](./PAID-API.md)). It refuses to start without a seller address |
+| Core | FastAPI, lifecycle, pricing engine, review agent, decision log, money ledger | Built. Money moves through the deployed escrow. The review agent is Claude once `MISTHOS_ANTHROPIC_API_KEY` is set, and a rule reviewer otherwise |
 | Worker | Sweeper: claim expiry, deadline refunds, silent-publisher release | Built. Runs inside the API by default, or alone as `python -m misthos.workers` |
 | Contracts | `MisthosEscrow` | Built. Example, fuzz and invariant tests (#35) |
 | Data | Postgres, Redis | Built and optional. Postgres once `MISTHOS_DATABASE_URL` is set, memory otherwise. Redis once `MISTHOS_REDIS_URL` is set, for the per-issue lock, idempotency keys and rate limits across processes |
-| Compliance | Screening, identity at first payout, statements | Built against simulated providers. See [PRIVACY.md](./PRIVACY.md) |
-| GitHub | App authentication, read path, write path, webhooks | Built behind one gateway. Simulated until `MISTHOS_GITHUB_APP_ID` and `MISTHOS_GITHUB_APP_PRIVATE_KEY` are set; `backend/github-app-manifest.json` registers the App |
-| Sign-in | Sign-In with Ethereum, a role per wallet, GitHub account linking, explicit lifecycle actions | Built. Linking is simulated until `MISTHOS_GITHUB_OAUTH_CLIENT_ID` is set. Outside the simulation every write needs a signed-in account |
-| Integrations | Circle wallets, Arc settlement | Arc settlement built behind the chain gateway (`services/chain/arc.py`), simulated by default; Circle wallet sessions built, the browser step pending |
+| Compliance | Screening, identity at first payout, statements | Built against Stripe Identity and the OFAC SDN list. See [PRIVACY.md](./PRIVACY.md) |
+| GitHub | App authentication, read path, write path, webhooks | Built behind one gateway and required; `backend/github-app-manifest.json` registers the App |
+| Sign-in | One gate: a wallet (MetaMask or a Circle wallet), a GitHub account, then a role per wallet; explicit lifecycle actions | Built (#181). Linking needs `MISTHOS_GITHUB_OAUTH_CLIENT_ID`; a Circle wallet needs the edge. Every write needs a signed-in account |
+| Integrations | Circle wallets, Arc settlement | Arc settlement built behind the chain gateway (`services/chain/arc.py`); Circle wallet sessions built, the browser step pending |
 
 Everything marked not built has its interface in place, which is why the missing pieces are listed here as work rather than as risk.
 
@@ -36,7 +36,6 @@ These come from the business documents and are treated as fixed. Every decision 
 | C3 | Fixed price set before publication, no bidding, no auction, no negotiation | [06 The pricing engine](./misthos/06-pricing-engine.md) |
 | C4 | GitHub is the only forge integration | [02 Problem and vision](./misthos/02-problem-and-vision.md) |
 | C5 | Agent budgets enforced somewhere the agent cannot reach | [08 Trust, compliance and risk](./misthos/08-trust-compliance-and-risk.md) |
-| C6 | Finance integration is read-only | [06 The pricing engine](./misthos/06-pricing-engine.md) |
 | C7 | Settlement cost must stay viable for a $50 issue | [07 Business model and economics](./misthos/07-business-model-and-economics.md) |
 
 C1 and C5 pull in opposite directions and set the shape of the whole system. C1 says the money cannot sit with us. C5 says a limit must bind an agent that we do not fully trust. The resolution is that the money sits in a contract and the limit lives in the same contract, so enforcement is a property of the chain rather than of our application code.
@@ -149,7 +148,7 @@ The Circle box is a platform dependency rather than a library. Three things in t
 | Component | Responsibility | Notes |
 | --- | --- | --- |
 | `frontend/` | The interface for publishers and contributors | Vite 6, React 19, TypeScript. An SPA, so no server rendering and no SEO to lose behind a login |
-| Routing | `react-router-dom` | The public landing page at `/`, then the app under its own nav: overview (`/overview`), issues, issue detail with its actions, loop, spend, plans, publish, account |
+| Routing | `react-router-dom` | The public landing page at `/`, then the app under its own nav: overview (`/overview`), issues, issue detail with its actions, publish, account |
 | Server state | TanStack Query | Caching and invalidation. A lifecycle action invalidates the issue, its timeline, the list and the metrics in one go |
 | API access | `openapi-typescript` plus `openapi-fetch` | The client is generated from the API's OpenAPI schema, so backend and frontend drift is a compile error rather than a runtime surprise |
 
@@ -159,8 +158,8 @@ The frontend holds no business rules. It renders state and calls endpoints, whic
 
 | Component | Responsibility | Notes |
 | --- | --- | --- |
-| `edge/` | The x402 seller gate and the Circle CLI bridge | Express, TypeScript |
-| x402 gate | Answers an unpaid request with `402` and a machine-readable `accepts` array, then settles and forwards | Circle's Gateway Nanopayments middleware ships as `@circle-fin/x402-batching`. Their own guidance for FastAPI and other non-Node APIs is a thin proxy in front, which is this process |
+| `edge/` | The x402 seller and the Circle CLI bridge | Express, TypeScript |
+| x402 seller | Answers an unpaid request with `402` and a machine-readable `accepts` array; verifies a payment, has the core answer, and settles only then | Circle's Gateway client ships as `@circle-fin/x402-batching`. Their own guidance for FastAPI and other non-Node APIs is a thin proxy in front, which is this process. The routes it sells are listed in `catalog.ts` and run in the core under `/api/v1/internal/paid/`, which only the edge's token opens. See [PAID-API.md](./PAID-API.md) |
 | Wallet bridge | Runs agent wallet operations | Agent wallets are documented around the Circle CLI, a Node package |
 
 This process exists for exactly two reasons and both are Node-only dependencies. Anything else that lands here belongs in the core instead.
@@ -172,12 +171,11 @@ This process exists for exactly two reasons and both are Node-only dependencies.
 | `backend/src/misthos/api/` | HTTP surface under `/api/v1` | FastAPI. Sign-in, issues, proposals, lifecycle actions, metrics, decisions, webhook receiver. `api/session.py` decides who may do what |
 | `backend/src/misthos/domain/` | Lifecycle state machine, money units, pricing engine | Deliberately IO-free, so the two places a bug costs real funds are testable without a database |
 | `backend/src/misthos/store.py` | The lifecycle's single writer, and the seeded simulation | Every move is checked against the transition table and saved through a repository |
-| `backend/src/misthos/services/metrics.py` | Every dashboard number | Computed from money events and lifecycle records, so each one is reproducible from the database alone. `/loop` is the public view of the same numbers |
+| `backend/src/misthos/services/metrics.py` | Every dashboard number | Computed from money events and lifecycle records, so each one is reproducible from the database alone |
 | `backend/src/misthos/repositories/` | Persistence behind one protocol | Memory by default and as the test double; Postgres, or a SQLite file, when `MISTHOS_DATABASE_URL` is set. Alembic migrations in `migrations/` |
 | Pricing engine | Produces the suggested band, recommendation and justification | Scores six signals, then anchors them to settled comparables. Advice only: the publisher names the price, and nothing here refuses or caps it |
 | Review service | `backend/src/misthos/services/review/`: judges each criterion against the diff, and the verdict follows by fixed rules (`domain/review.py`) | The verdict is the decision. Only a merge or the grace period moves money |
 | Settlement orchestrator | Commits, releases, refunds, reconciles | The only component that can move money, and it moves it by calling a contract |
-| Finance adapter | Reads budget and cash context, read-only | Pluggable. Firefly III first, then beancount, Odoo, ERPNext, Invoice Ninja |
 
 The lifecycle is the single writer of issue state. Letting the pricing engine or the webhook handler write state directly is the fastest way to get an issue that is both funded and refunded.
 
@@ -275,7 +273,7 @@ every step. They run on every pull request with the rest of the Foundry suite.
 
 ## Runtime topology
 
-Four processes, three ports, and no infrastructure to run for the simulation. `compose.yaml` runs all four against Postgres and Redis, and [DEPLOY.md](./DEPLOY.md) covers it and the testnet deploy.
+Four processes, three ports, and no infrastructure needed for a local run. `compose.yaml` runs all four against Postgres and Redis, and [DEPLOY.md](./DEPLOY.md) covers it and the testnet deploy.
 
 ```mermaid
 flowchart LR
@@ -310,7 +308,7 @@ Every process logs one JSON object per line when `MISTHOS_LOG_JSON` is set, each
 
 Two consequences worth being explicit about, because they are the difference between a demo and a system.
 
-A restart loses the simulation only when no database is configured. With `MISTHOS_DATABASE_URL` set, state lives in Postgres behind the same repository protocol the memory store implements, which is how it got there without touching the domain.
+A restart loses in-memory state only when no database is configured. With `MISTHOS_DATABASE_URL` set, state lives in Postgres behind the same repository protocol the memory store implements, which is how it got there without touching the domain.
 
 Two processes can no longer both claim an issue: the second is refused while the first holds the issue's lock, every save carries a version so a stale one is refused, and the schema allows one active claim per issue. A request that moves money or publishes an issue can carry an `Idempotency-Key`, and publishing and actions are rate-limited per client. Without Redis those keys and counters are per process, so set `MISTHOS_REDIS_URL` before running more than one API process behind a load balancer.
 
@@ -338,7 +336,7 @@ flowchart LR
 
 **Path A carries the work payment.** A publisher commits USDC into `MisthosEscrow` against a specific issue. The contract holds it. On acceptance it releases to the contributor with the platform's take rate carved out of the same commitment, on deadline it refunds in full. This is the path that satisfies C1, because the platform is never a custodian, and C7, because an Arc transfer costs about a cent.
 
-**Path B carries everything metered.** Paying our own review agents per invocation, a publisher buying a pricing report, or any endpoint we expose for agents to consume. No escrow, no commitment, no state. The agent pays per request and gets a result.
+**Path B carries everything metered.** Read-only views an agent buys per call: the decision log, a reputation, an escrow attestation, a price, a pre-flight review (#200). No escrow, no commitment, no state. The agent pays per request and gets a result, and a request that fails is not charged: the edge verifies the payment, has the core answer, and settles only then. Every settlement is recorded in the core's ledger of paid calls and reconciled against Gateway. See [PAID-API.md](./PAID-API.md).
 
 The reason to keep them apart is that escrow and nanopayments want different things from an account. Gateway Nanopayments and x402 batch settlement require EOA signatures and do not support ERC-1271, while escrow wants contract logic. Forcing one mechanism to do both jobs would mean either giving up programmable release or giving up batched settlement.
 
@@ -421,7 +419,6 @@ flowchart LR
     I["Issue from GitHub"] --> C["Complexity signals"]
     I --> S["Semantic scoping"]
     O["Prior settled issues"] --> M["Market comparables"]
-    F["Publisher finance context<br/>read-only, display only,<br/>not in the price path"]
     C --> A["Advisory band, recommendation<br/>and justification"]
     M --> A
     S --> A
@@ -435,14 +432,7 @@ flowchart LR
 How it is built today (epic #11):
 
 - **Comparables are the platform's own settled issues** (`domain/comparables.py`, #42). An issue is compared with work settled in the last year whose signals are within three quarters of a point, as a weighted root mean square, with the same repository ranked first. Each settled price is scaled by how much more or less effort this issue is. The median of those moves the formula's price a quarter of the way for one comparable, and at most half of the way however many there are. Confidence follows them and nothing else: low with none, high with three or more that agree within a factor of 1.5, medium otherwise. The proposal keeps the three closest, and the issue page shows them.
-- **The books inform, they do not bind** (`services/finance`, #43). The declared budget and what a connected books say are shown to the publisher alone (`/publishers/{id}/finance`, `FinanceOut`). The reader used to supply the ceiling the engine could not exceed; since #142 it is out of the price path entirely, and publishing is never refused on budget grounds. When the operator connects a publisher's books in `MISTHOS_FINANCE_CONNECTIONS` (Firefly III, or a beancount ledger with a Fava budget), the adapter still reads them, and a connection stays configured by the operator rather than through the API, because it carries a credential or a server path.
 - **The weights are calibrated by a harness, not by the engine itself** (`python -m misthos.services.calibration`, #41). It replays the engine over issues whose worth is known and reports how often the worth falls inside the band. It fits the rate, and the weights once there are twenty issues. The corpus holds real issues only, and it is empty until the team scores them. `--settled` runs the harness on the platform's own settlements instead. Now that the publisher names the price, a settled amount is what a buyer paid rather than an independent valuation, so the report stays a self-consistency check rather than a calibration, and nothing is fitted from it. The harness tunes the advice only: no fitted value refuses or caps a price.
-
-The finance adapter is read-only by design. It answers two questions: what is left in the relevant budget, and what the cash position looks like. It never writes.
-
-Firefly III is the first adapter because the hackathon brief points at it, and it comes with limits worth recording. It is a personal finance manager with no chart of accounts, its own documentation refuses programmatic write access as unreliable, and its rules engine can delete a journal. That is why the adapter interface exists rather than a Firefly integration: the first customer running Odoo should be a new adapter, not a rewrite.
-
-The adapter falls back to a declared budget when no finance system is connected. That fallback has to work well, because most early publishers will use it, and it is a figure for the publisher to read rather than an input to any price.
 
 ## The review pipeline
 
@@ -470,7 +460,7 @@ sequenceDiagram
 
 Criteria are the standard every verdict is measured against, so they are made checkable before any money is committed (`domain/criteria.py`, #38). The first draft comes from the issue itself: what kind of change it is (bug, security, feature, performance, docs), the files the issue names, and the publisher's own task list. Each drafted criterion names something a reviewer can look at: a test, a file, a document, an output or a number. When the publisher approves them, the API refuses any criterion a reviewer could not judge, with the reason: a question, a fragment, a judgement word with nothing to check it against ("works properly"), several criteria run together, or a repeat. The rules aim to refuse the clearly uncheckable, not to second-guess specific prose, and every seeded criterion passes them.
 
-How it is built today. The sweeper, or the demo stepper, hands every submitted commit that has no verdict to the review agent. The agent reads the changed files and judges each acceptance criterion with evidence: Claude when a key is configured, through a forced tool call so the answer is structured, or a rule reviewer that judges only what a file list proves (a test, documentation, a changelog entry) and leaves the rest unjudged. The verdict is not the agent's to pick. `domain/review.py` derives it from the judgements, the project's checks and the rework count, so the same judgements always give the same verdict and the decision log names the rule that produced it. The judgement runs outside the issue's lock and is applied only if the same commit is still under review, so a push during a slow review is never judged on the old code. Checks that have not reported on the commit are unknown rather than failing (`submissions.checks_passed` is NULL): the sweeper waits `CHECKS_WAIT` (30 minutes) after the submission for them, a `check_run` that settles them earlier lets the next pass review it, and after the wait the work is judged on the criteria alone with a finding that says the checks had not reported. Without that, a repository with no CI could never be accepted. Failing checks are still rework.
+How it is built today. The sweeper hands every submitted commit that has no verdict to the review agent. The agent reads the changed files and judges each acceptance criterion with evidence: Claude when a key is configured, through a forced tool call so the answer is structured, or a rule reviewer that judges only what a file list proves (a test, documentation, a changelog entry) and leaves the rest unjudged. The verdict is not the agent's to pick. `domain/review.py` derives it from the judgements, the project's checks and the rework count, so the same judgements always give the same verdict and the decision log names the rule that produced it. The judgement runs outside the issue's lock and is applied only if the same commit is still under review, so a push during a slow review is never judged on the old code. Checks that have not reported on the commit are unknown rather than failing (`submissions.checks_passed` is NULL): the sweeper waits `CHECKS_WAIT` (30 minutes) after the submission for them, a `check_run` that settles them earlier lets the next pass review it, and after the wait the work is judged on the criteria alone with a finding that says the checks had not reported. Without that, a repository with no CI could never be accepted. Failing checks are still rework.
 
 The diff is written by the person whose payment depends on the verdict, so it is handed to the model as data, and the model is told that instructions inside it are part of the submission.
 
@@ -502,7 +492,7 @@ erDiagram
 
 | Entity | Key fields | Notes |
 | --- | --- | --- |
-| Publisher | GitHub org or user id, wallet address, tier, budget rules | Identity is the GitHub account |
+| Publisher | GitHub org or user id, wallet address, budget rules | Identity is the GitHub account |
 | Issue | Repo, number, acceptance criteria, state, deadline | State owned by the lifecycle service |
 | PriceProposal | Band low, band high, recommended, signals, justification, confidence, fundable | The engine's suggestion on the issue, surfaced as `IssueOut.proposal`. `fundable` is always true: it never refuses or caps the price the publisher names |
 | EscrowCommitment | Issue id, amount, chain, tx hash, deadline | Mirrors on-chain state. The chain is the source of truth |
@@ -545,26 +535,17 @@ Every key is prefixed `misthos:`. The sweeper's single-runner lock is a Postgres
 
 A `released` money event is written with the transfer the chain returned, and the transaction hash is unique. A retry that tries to write the same hash fails on the constraint rather than paying twice, which is the failure the market research warns about: an agent that retries after a timeout can pay an invoice twice and the books will still balance. The idempotency key stops the retry before it reaches the chain, and the contract's `NotHeld` check stops a second release if one somehow did.
 
-## The organisation tier
+## The organisation's own controls
 
 An organisation sets its own spending policy, and the store enforces it at the two moments money moves, out of the agent's reach (`domain/policy.py`, #51):
 
 - **Category limits.** A monthly cap per issue label. A commitment that would pass it is refused at funding, with the limit and the month's total in the reason.
 - **A release threshold with named approvers.** A payout above it is held as `await_approver` until one of them approves, whether the merge or the grace period triggered it. The approval is required, not requested.
-- **Approvers are GitHub logins, and the approval is the session's.** A login is what a session proves: the wallet signs in, and GitHub's OAuth links the login to it. So `POST /issues/{id}/approve-release` takes the approver from the signed-in account's linked login, never from the request, and the organisation must have named it. Holding the organisation's wallet confers nothing: its own account approves only if its own login is named. The contributor being paid never approves their own payout. A policy naming something that cannot be a login, such as an e-mail address, is refused, because no session could ever satisfy it. Only the simulation, for a visitor who is not signed in, accepts a name in the request, as it does for a claim.
+- **Approvers are GitHub logins, and the approval is the session's.** A login is what a session proves: the wallet signs in, and GitHub's OAuth links the login to it. So `POST /issues/{id}/approve-release` takes the approver from the signed-in account's linked login, never from the request, and the organisation must have named it. Holding the organisation's wallet confers nothing: its own account approves only if its own login is named. The contributor being paid never approves their own payout. A policy naming something that cannot be a login, such as an e-mail address, is refused, because no session could ever satisfy it.
 
-`/publishers/{id}/spend` reports what was budgeted, committed, released and refunded in the year, by category, and beside each limit what was committed this calendar month, counted by the same function funding checks the limit with (#50). It also lists the settled compliance and security fixes a security review can file. `/publishers/{id}/audit` exports the decision record and the money events unedited, as JSON or one sortable CSV (#52), leaving out only each release's transfer reference ([PRIVACY.md](./PRIVACY.md)). All three are the organisation's alone: a signed-in publisher sees and sets its own, and only the simulation serves any.
+`/publishers/{id}/audit` exports the decision record and the money events unedited, as JSON or one sortable CSV (#52), leaving out only each release's transfer reference ([PRIVACY.md](./PRIVACY.md)). It is the organisation's alone: a signed-in publisher reads its own.
 
 Every CSV the platform serves, the audit export and a contributor's statement alike, carries other people's words: issue titles, repository and organisation names, reasons. A cell a spreadsheet would run as a formula, one starting with `=`, `+`, `-`, `@`, a tab or a carriage return, is written as text with a leading apostrophe. A plain number keeps its sign (`services/spreadsheet.py`).
-
-**Plans** (`domain/plans.py`, `api/v1/plans.py`, #53) follow the tier table in 06. Open costs nothing. Team costs $249 a month, and adds budget rules, approval thresholds and spend reporting. Enterprise starts at $2,000 a month, and adds the audit export, SSO and a support commitment. The take rate and the minimum price are the same on every plan, and a plan changes neither: the platform keeps a flat 10 percent (`PLATFORM_FEE_BPS`), and $5 is the lowest price any plan may publish. A subscription buys controls, reporting and support, not a different rate.
-
-- **What a plan unlocks.** Each of those routes answers 402, naming the plan that includes it. Enforcement of a policy already set never stops, even when a plan lapses, because a limit that protects an organisation's money is not a feature to switch off for non-payment.
-- **Buying Team.** Team is bought from the web app without a conversation. The publisher chooses it and is told what to send: USDC on Arc, from its own wallet, to `MISTHOS_PLATFORM_WALLET`. It confirms the transaction, and the server reads the USDC `Transfer` log from the receipt over JSON-RPC (`services/billing/arc.py`) before switching the plan on. We never hold a key that moves a publisher's money, and one transaction pays for one period.
-- **When a period ends.** The sweeper marks a period that ended unpaid as past due, gives it seven days' grace, and then moves the organisation back to Open. A cancelled plan ends at its period end.
-- **Enterprise** is agreed in a contract and recorded by an operator (`python -m misthos.services.contracts`).
-- **The simulation** has its own rail, so the demo can buy Team with a button.
-- **Not built yet:** SSO, which needs organisation membership beyond one wallet per party.
 
 ## Trust boundaries
 
@@ -598,17 +579,17 @@ flowchart TB
 
 ### Who may do what
 
-The line between T1 and T2 is a wallet signature. A wallet signs in with a Sign-In with Ethereum message (EIP-4361) that names this site's domain, an Arc chain and a single-use nonce, and the session is an HMAC-signed token in an HttpOnly, SameSite=Lax cookie, or a bearer header for an API client (`auth/`, #70). A wallet takes one role, publisher or contributor, and links one GitHub account through OAuth, keeping only the login (#80). The link is what ties a GitHub identity to a party: a publisher's issues and a contributor's pull requests must match it.
+The line between T1 and T2 is a wallet signature. A wallet signs in with a Sign-In with Ethereum message (EIP-4361) that names this site's domain, an Arc chain and a single-use nonce, and the session is an HMAC-signed token in an HttpOnly, SameSite=Lax cookie, or a bearer header for an API client (`auth/`, #70). A wallet takes one role, publisher or contributor, and links one GitHub account through OAuth, keeping only the login (#80). The link is what ties a GitHub identity to a party: a publisher's issues and a contributor's pull requests must match it. The sign-in gate links GitHub before the role is chosen (#181), so the login is held against the wallet in `pending_github_links` until choosing the role creates the account and adopts it; a held login takes the one-login-one-wallet slot exactly as a linked one does. A Circle wallet is a second way to sign in: an EOA, because the address is recovered from an EIP-191 signature and a smart account's EIP-1271 signature cannot be, which signs the same message through a `SIGN_MESSAGE` challenge in Circle's frame and is verified by the same `/auth/verify`.
 
 | Action | Who | Refused with |
 | --- | --- | --- |
 | Publish, approve criteria, fund, decline, approve a release, set policy | The publishing organisation, linked to GitHub | 401 signed out, 403 anyone else |
 | Claim, submit, dispute | A contributor linked to GitHub; a submission must be a pull request it opened | 401 signed out, 403 anyone else |
 | Ask for a review now | The publisher or the claimant | 401, 403 |
-| Spend, audit export, statements, a publisher's budget and policy | The party itself | 401, 403 |
+| Audit export, statements, a publisher's budget and policy | The party itself | 401, 403 |
 | Everything else read-only | Anyone | |
 
-Criteria are approved before the price, and funding is refused until they are (#21), so the contract a contributor claims is the one the publisher read. The simulation still lets an anonymous visitor drive the seeded demo, and only the simulation serves the demo stepper, which fabricates a pull request and a merge. It also serves the simulated GitHub's side to the web app: `/demo/issues/{id}/pull-request` opens the claimant's pull request and `/demo/issues/{id}/merge` merges it, handled exactly as the real merge's webhook is, so the browser can run the loop with every other step real. Its reset, `/demo/reset`, needs no sign-in and deletes every row, so it is refused wherever a database is configured unless the operator sets `MISTHOS_ALLOW_DEMO_RESET` for a demo they mean to throw away.
+Criteria are approved before the price, and funding is refused until they are (#21), so the contract a contributor claims is the one the publisher read. Every lifecycle step is an explicit action by the party it belongs to: publishing, approving criteria and price, funding from the publisher's own wallet, claiming, submitting a pull request, and merging on GitHub.
 
 The interesting line is between T3 and T4. Our services can produce an acceptance attestation, but only the escrow contract can act on it, and only for an issue whose funds are committed. Compromising a service gets an attacker the ability to request a release, not the ability to move a budget.
 
@@ -679,11 +660,10 @@ Inference is roughly nine hundred times the settlement cost. Any optimisation ef
 | # | Decision | Rationale | Reversibility |
 | --- | --- | --- | --- |
 | ADR-1 | Escrow funds live in a contract on Arc, never in a platform account | Removes custody, removes the failure mode that bankrupted the previous attempt in this category | Hard. This is the trust story |
-| ADR-2 | Two settlement paths: escrowed work payments, x402 for metered calls | Each mechanism is good at one job, and both are available. Forcing one to do both would cost programmable release or batched settlement | Medium |
+| ADR-2 | Two settlement paths: escrowed work payments, x402 for metered calls. Path B sells reads only, from an allowlist, and settles after the work succeeds (#201) | Each mechanism is good at one job, and both are available. Forcing one to do both would cost programmable release or batched settlement. Settling after the work means a failed call costs the buyer nothing; Gateway's `exact`-only scheme means a variable cost is sold at a cap | Medium |
 | ADR-3 | Fixed price set before publication, no bidding | See [06 The pricing engine](./misthos/06-pricing-engine.md). A price round rewards the least careful bidder | Medium |
 | ADR-4 | The review agent decides, and the publisher's merge is the only human signature on release | C2, and the hackathon's own framing of where an agent's authority must stop | Superseded: the human second opinion was a third party with a fee, and it cost more than it bought |
 | ADR-5 | GitHub only | One integration done deeply beats three done shallowly. Acceptance criteria can read the project's own test suite | Medium |
-| ADR-6 | Finance integration is read-only and adapter-shaped | Writing to a customer's ledger inherits liability with no product benefit. Firefly III is too narrow to be the only shape | Easy |
 | ADR-7 | Identity verification at payout, not signup | Verification at signup is the largest contributor drop-off cause | Easy |
 | ADR-8 | Arc is the only settlement chain | Sub-second deterministic finality and cent-level fees are the reason the product is viable at small amounts | Hard while the cost advantage holds |
 | ADR-9 | Decision log is append-only | Delegated authority requires a record that can be replayed. A mutable log is not evidence | Hard |

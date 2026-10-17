@@ -8,18 +8,21 @@ put on the issue that now exists.
 
 from __future__ import annotations
 
+import pytest
+
 from misthos.domain.signals import IssueFacts
 from misthos.repositories import MemoryRepository
 from misthos.schemas import PublishRequest
-from misthos.services.github import GitHubError, SimulatedGitHub
+from misthos.services.github import GitHubError
 from misthos.store import Store, UnreadableIssue
+from tests.support.fake_github import FakeGitHub
 
 REPO = "acme/ledger"
 PUBLISHER = "PUB-1"
 
 
-class CreatingGitHub(SimulatedGitHub):
-    """An App that can open issues: the simulation's reads, plus a real creation."""
+class CreatingGitHub(FakeGitHub):
+    """An App that can open issues: the fake's reads, plus a real creation."""
 
     creates_issues = True
 
@@ -40,8 +43,47 @@ class CreatingGitHub(SimulatedGitHub):
 
 
 def store_with(github: CreatingGitHub) -> Store:
-    store = Store(MemoryRepository(), github=github)
-    store.reset()
+    from tests.support.fake_chain import FakeChain
+    from tests.support.fake_compliance import FakeIdentity, FakeScreening
+    from tests.support.seeded import SeededStore
+
+    return SeededStore(
+        MemoryRepository(),
+        github=github,
+        chain=FakeChain(),
+        screening=FakeScreening(),
+        identity=FakeIdentity(),
+    )
+
+
+def unseeded_store(github: CreatingGitHub) -> Store:
+    """A plain Store, as the API builds it.
+
+    The seeded test double subclasses Store and defines `_build` itself, which hid
+    a publish path that called a method only the fixture had (#207).
+    """
+    from misthos.schemas import Publisher, Wallet
+    from tests.support.fake_chain import FakeChain
+    from tests.support.fake_compliance import FakeIdentity, FakeScreening
+
+    store = Store(
+        MemoryRepository(),
+        github=github,
+        chain=FakeChain(),
+        screening=FakeScreening(),
+        identity=FakeIdentity(),
+    )
+    store.save_publisher(
+        Publisher(
+            id=PUBLISHER,
+            name="Acme Payments",
+            kind="company",
+            wallet=Wallet(
+                address="0xAcme00000000000000000000000000000000A1", chain="5042002"
+            ),
+            budget_remaining_usdc="1000.00",
+        )
+    )
     return store
 
 
@@ -63,8 +105,10 @@ class TestPublishingDescription:
         github = CreatingGitHub()
         rec = publish(store_with(github))
 
+        # The platform label goes on with the publisher's, so the issue it creates is
+        # visible to the label-driven flow as well as to this form (#199).
         assert github.created == [
-            (REPO, "Retry on 503", "The retry budget ignores jitter.", ["bug"])
+            (REPO, "Retry on 503", "The retry budget ignores jitter.", ["bug", "misthos"])
         ]
         # The number is GitHub's, and the issue that was priced is the one created.
         assert rec.number == 901
@@ -87,11 +131,45 @@ class TestPublishingDescription:
         else:  # pragma: no cover - the refusal is the point of the test
             raise AssertionError("publishing invented a number instead of reporting the refusal")
 
-    def test_the_simulation_still_makes_a_number_up(self) -> None:
-        """Its GitHub holds no repository to open an issue in, so nothing is created."""
+    def test_linking_an_existing_issue_adds_the_platform_label(self) -> None:
+        github = CreatingGitHub()
+        store = store_with(github)
+
+        publish(store, number=412)
+
+        assert [(sent.kind, sent.repo, sent.target, sent.body) for sent in github.sent] == [
+            ("labels", REPO, "412", "misthos")
+        ]
+
+    def test_a_label_that_cannot_be_added_refuses_the_link(self) -> None:
+        github = CreatingGitHub()
+        store = store_with(github)
+        github.fail_writes = True
+
+        with pytest.raises(UnreadableIssue, match="misthos"):
+            publish(store, number=412)
+
+        assert store.find_open(REPO, 412) is None
+
+    def test_a_gateway_that_cannot_create_issues_still_makes_a_number_up(self) -> None:
+        """The fake holds no repository to open an issue in, so nothing is created."""
         github = CreatingGitHub()
         github.creates_issues = False
         rec = publish(store_with(github))
 
         assert github.created == []
         assert rec.number > 0
+
+
+class TestTheLiveStore:
+    def test_publishing_builds_a_listing_on_the_plain_store(self) -> None:
+        """The API runs a plain Store; only the test double used to have `_build`."""
+        github = CreatingGitHub()
+        service = unseeded_store(github)
+
+        rec = publish(service, number=412)
+
+        assert rec.repo == REPO
+        assert rec.number == 412
+        assert rec.publisher_id == PUBLISHER
+        assert service.find_open(REPO, 412) is not None
